@@ -1,0 +1,179 @@
+{
+  "version": "1.0",
+  "description": "港股标的池 - 恒生指数成分股",
+  "last_updated": "2026-03-07 23:30:03",
+  "hsi_stocks": [
+    {
+      "code": "HK.00700",
+      "name": "腾讯控股",
+      "sector": "科技"
+    },
+    {
+      "code": "HK.09988",
+      "name": "百度集团-SW",
+      "sector": "科技"
+    },
+    {
+      "code": "HK.01810",
+      "name": "小米集团-W",
+      "sector": "科技"
+    },
+    {
+      "code": "HK.03690",
+      "name": "美团-W",
+      "sector": "科技"
+    },
+    {
+      "code": "HK.06618",
+      "name": "京东集团-SW",
+      "sector": "科技"
+    },
+    {
+      "code": "HK.09618",
+      "name": "携程集团-S",
+      "sector": "科技"
+    },
+    {
+      "code": "HK.02318",
+      "name": "中国平安",
+      "sector": "金融"
+    },
+    {
+      "code": "HK.00939",
+      "name": "建设银行",
+      "sector": "金融"
+    },
+    {
+      "code": "HK.02628",
+      "name": "工商银行",
+      "sector": "金融"
+    },
+    {
+      "code": "HK.00981",
+      "name": "中银香港",
+      "sector": "金融"
+    },
+    {
+      "code": "HK.02388",
+      "name": "友邦保险",
+      "sector": "金融"
+    },
+    {
+      "code": "HK.01398",
+      "name": "港交所",
+      "sector": "金融"
+    },
+    {
+      "code": "HK.00005",
+      "name": "汇丰控股",
+      "sector": "金融"
+    },
+    {
+      "code": "HK.02015",
+      "name": "理想汽车-W",
+      "sector": "新能源汽车"
+    },
+    {
+      "code": "HK.09868",
+      "name": "小鹏汽车-W",
+      "sector": "新能源汽车"
+    },
+    {
+      "code": "HK.02518",
+      "name": "蔚来-SW",
+      "sector": "新能源汽车"
+    },
+    {
+      "code": "HK.02331",
+      "name": "泡泡玛特",
+      "sector": "消费"
+    },
+    {
+      "code": "HK.06186",
+      "name": "京东物流",
+      "sector": "消费"
+    },
+    {
+      "code": "HK.01928",
+      "name": "周大福",
+      "sector": "消费"
+    },
+    {
+      "code": "HK.02269",
+      "name": "海底捞",
+      "sector": "消费"
+    },
+    {
+      "code": "HK.03616",
+      "name": "农夫山泉",
+      "sector": "消费"
+    },
+    {
+      "code": "HK.02218",
+      "name": "阿里健康",
+      "sector": "医疗健康"
+    },
+    {
+      "code": "HK.06612",
+      "name": "平安好医生",
+      "sector": "医疗健康"
+    },
+    {
+      "code": "HK.01885",
+      "name": "康希诺生物",
+      "sector": "医疗健康"
+    },
+    {
+      "code": "HK.01171",
+      "name": "碧桂园",
+      "sector": "地产"
+    },
+    {
+      "code": "HK.01628",
+      "name": "银河娱乐",
+      "sector": "博彩"
+    },
+    {
+      "code": "HK.00027",
+      "name": "九龙仓置业",
+      "sector": "地产"
+    },
+    {
+      "code": "HK.06808",
+      "name": "华润置地",
+      "sector": "地产"
+    },
+    {
+      "code": "HK.00728",
+      "name": "中国电信",
+      "sector": "通信"
+    },
+    {
+      "code": "HK.02618",
+      "name": "中国联通",
+      "sector": "通信"
+    }
+  ],
+  "user_stocks": [
+    {
+      "code": "HK.0理想汽车",
+      "name": "HK.0理想汽车",
+      "sector": "用户自定义",
+      "added_date": "2026-03-07",
+      "source": "user"
+    },
+    {
+      "code": "HK.00NIO",
+      "name": "NIO蔚来",
+      "sector": "用户自定义",
+      "added_date": "2026-03-07",
+      "source": "user"
+    }
+  ],
+  "hsi_refresh_date": "2026-03-07",
+  "stats": {
+    "hsi_count": 30,
+    "user_count": 2,
+    "total_count": 32
+  }
+}
