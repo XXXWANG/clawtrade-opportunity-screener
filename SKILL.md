@@ -1,6 +1,6 @@
 ---
 name: clawtrade-opportunity-screener
-description: 多因子股票机会筛选与识别
+description: 港股多因子机会筛选、自动筛选、组合建议与 TCC 兼容调度执行
 metadata: {"openclaw":{"requires":{"bins":["python3"]},"os":["darwin","linux","win32"]}}
 ---
 
@@ -10,16 +10,21 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]},"os":["darwin","linux","w
 - 统一通过 {baseDir}/screener_skill.py 执行
 - 数据源为 clawtrade-futu-paper-trade 技能（futu-api）
 - 需要本地 FutuOpenD 处于运行状态
+- 支持 direct CLI 和 TCC `--task_id` 两种运行模式
 
 环境变量
 - FUTU_HOST：FutuOpenD 地址，默认 127.0.0.1
 - FUTU_PORT：FutuOpenD 端口，默认 11111
 - FUTU_TRD_MARKET：固定 HK
-- FUTU_PAPER_TRADE_DIR：clawtrade-futu-paper-trade 技能目录（可选）
+- FUTU_PAPER_TRADE_DIR：clawtrade-futu-paper-trade 技能目录或脚本路径（可选）
+- SCREENER_TCC_TASKS_FILE：TCC `global_tasks.json` 覆盖路径（可选）
+- SCREENER_TCC_LOCK_FILE：TCC `.tasks.lock` 覆盖路径（可选）
 
 常用命令
 - 输出工作流框架：
   python3 {baseDir}/screener_skill.py workflow
+- TCC 任务执行：
+  python3 {baseDir}/screener_skill.py --task_id task_xxxx
 - 多因子筛选（港股）：
   python3 {baseDir}/screener_skill.py screen --symbols HK.00700 HK.09988
 - 指定筛选区间：
@@ -77,3 +82,11 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]},"os":["darwin","linux","w
 输出说明
 - 所有输出为 JSON
 - 失败时返回 error 字段，包含原因与建议
+- TCC 模式下会按协议从 `global_tasks.json` 读取 payload，并在完成后回写 `completed` / `pending` / `failed`
+
+TCC payload 约定
+- payload 需包含 `command`
+- 推荐格式：
+  {"command":"screen","args":{"symbols":["HK.00700","HK.09988"],"monthly_target":0.01,"dynamic_threshold":true}}
+- 也兼容扁平格式：
+  {"command":"auto","universe":["HK.00700"],"signal_return_21":0.03}

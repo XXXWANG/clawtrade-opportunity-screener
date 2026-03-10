@@ -4,14 +4,49 @@ import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 
+TCC_CAPTURE_MODE = False
+NEUTRAL_SCORE = 50.0
+MISSING_METRIC_SCORE = 40.0
+FULL_SAMPLE_SIZE = 5
+
+
+class SkillExit(Exception):
+    def __init__(self, payload, exit_code):
+        super().__init__(payload.get("error") if isinstance(payload, dict) else str(payload))
+        self.payload = payload
+        self.exit_code = exit_code
+
+
+@contextmanager
+def advisory_file_lock(lock_path):
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "w", encoding="utf-8")
+    try:
+        if not sys.platform.startswith("win"):
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        if not sys.platform.startswith("win"):
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
 def json_out(payload, exit_code=0):
     print(json.dumps(payload, ensure_ascii=False))
+    if TCC_CAPTURE_MODE:
+        raise SkillExit(payload, exit_code)
     sys.exit(exit_code)
 
 
@@ -72,16 +107,24 @@ def ensure_venv():
         python_path = venv_dir / "Scripts" / "python.exe"
         pip_path = venv_dir / "Scripts" / "pip.exe"
     python_cmd = select_python()
-    if python_path.exists():
-        venv_version = get_python_version(str(python_path))
-        if not is_compatible_python(venv_version):
-            shutil.rmtree(venv_dir, ignore_errors=True)
-    if not python_path.exists():
-        subprocess.check_call([python_cmd, "-m", "venv", str(venv_dir)])
-    if not pip_path.exists():
-        raise RuntimeError("虚拟环境创建失败")
-    requirements = base_dir / "requirements.txt"
-    subprocess.check_call([str(pip_path), "install", "-r", str(requirements)])
+    lock_path = base_dir / ".venv.lock"
+    with advisory_file_lock(lock_path):
+        if python_path.exists():
+            venv_version = get_python_version(str(python_path))
+            if not is_compatible_python(venv_version):
+                shutil.rmtree(venv_dir, ignore_errors=True)
+        if not python_path.exists():
+            subprocess.check_call([python_cmd, "-m", "venv", str(venv_dir)])
+        if not pip_path.exists():
+            raise RuntimeError("虚拟环境创建失败")
+        requirements = base_dir / "requirements.txt"
+        if requirements.exists():
+            stamp_path = venv_dir / ".requirements_installed"
+            stamp_value = str(requirements.stat().st_mtime_ns)
+            installed_value = stamp_path.read_text(encoding="utf-8").strip() if stamp_path.exists() else ""
+            if installed_value != stamp_value:
+                subprocess.check_call([str(pip_path), "install", "-r", str(requirements)])
+                stamp_path.write_text(stamp_value, encoding="utf-8")
     env = os.environ.copy()
     env["SCREEN_SKILL_VENV"] = "1"
     subprocess.check_call([str(python_path), str(Path(__file__).resolve()), *sys.argv[1:]], env=env)
@@ -90,24 +133,37 @@ def ensure_venv():
 
 def resolve_futu_skill_path():
     env_path = os.environ.get("FUTU_PAPER_TRADE_DIR") or os.environ.get("FUTU_PAPER_TRADE_PATH")
+    script_names = ("futu_skill.py", "xtrade_futu_skill.py")
+    base_dir = Path(__file__).resolve().parent
+    candidate_dirs = []
     if env_path:
-        base_dir = Path(env_path).expanduser().resolve()
-    else:
-        base_dir = Path(__file__).resolve().parent.parent / "clawtrade-futu-paper-trade"
-    script = base_dir / "futu_skill.py"
-    if not script.exists():
-        json_out(
-            {
-                "ok": False,
-                "error": "未找到 clawtrade-futu-paper-trade 技能入口",
-                "next_steps": [
-                    "确认 clawtrade-futu-paper-trade 技能已安装",
-                    "设置 FUTU_PAPER_TRADE_DIR 指向 clawtrade-futu-paper-trade 目录",
-                ],
-            },
-            1,
-        )
-    return script
+        candidate_dirs.append(Path(env_path).expanduser().resolve())
+    candidate_dirs.extend(
+        [
+            base_dir.parent / "clawtrade-futu-paper-trade",
+            base_dir.parent / "Clawtrade-futu-paper-trade_Project",
+            base_dir / "clawtrade-futu-paper-trade",
+            base_dir / "Clawtrade-futu-paper-trade_Project",
+        ]
+    )
+    for candidate in candidate_dirs:
+        if candidate.is_file() and candidate.name in script_names:
+            return candidate
+        for script_name in script_names:
+            script = candidate / script_name
+            if script.exists():
+                return script
+    json_out(
+        {
+            "ok": False,
+            "error": "未找到 clawtrade-futu-paper-trade 技能入口",
+            "next_steps": [
+                "确认 clawtrade-futu-paper-trade 技能已安装",
+                "设置 FUTU_PAPER_TRADE_DIR 指向 clawtrade-futu-paper-trade 目录或脚本路径",
+            ],
+        },
+        1,
+    )
 
 
 def read_json_output(output):
@@ -148,14 +204,122 @@ def call_futu_skill(args):
     return payload
 
 
+def get_openclaw_workspace_root():
+    env_keys = ["OPENCLAW_WORKSPACE", "OPENCLAW_WORKSPACE_DIR", "WORKSPACE_DIR"]
+    for key in env_keys:
+        value = os.environ.get(key)
+        if value:
+            return Path(value).expanduser().resolve()
+    return Path.home() / ".openclaw" / "workspace"
+
+
+def resolve_tcc_tasks_file():
+    override = os.environ.get("SCREENER_TCC_TASKS_FILE")
+    if override:
+        return Path(override).expanduser().resolve()
+    return get_openclaw_workspace_root() / "skills" / "TCC" / "global_tasks.json"
+
+
+def resolve_tcc_lock_file(tasks_file):
+    override = os.environ.get("SCREENER_TCC_LOCK_FILE")
+    if override:
+        return Path(override).expanduser().resolve()
+    return tasks_file.parent / ".tasks.lock"
+
+
+@contextmanager
+def locked_tcc_registry():
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError("当前平台不支持 TCC 文件锁") from exc
+    tasks_file = resolve_tcc_tasks_file()
+    lock_file = resolve_tcc_lock_file(tasks_file)
+    if not tasks_file.exists():
+        raise RuntimeError(f"TCC 注册表不存在: {tasks_file}")
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_file, "w", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            with open(tasks_file, "r", encoding="utf-8") as tasks_handle:
+                data = json.load(tasks_handle)
+            yield data
+            with open(tasks_file, "w", encoding="utf-8") as tasks_handle:
+                json.dump(data, tasks_handle, ensure_ascii=False, indent=2)
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+def get_tcc_task_payload(task_id):
+    with locked_tcc_registry() as data:
+        for task in data.get("tasks", []):
+            if task.get("id") == task_id:
+                return dict(task.get("payload") or {})
+    raise RuntimeError(f"未找到 TCC 任务: {task_id}")
+
+
+def update_tcc_task_status(task_id, status, result=None):
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with locked_tcc_registry() as data:
+        for task in data.get("tasks", []):
+            if task.get("id") == task_id:
+                task["status"] = status
+                task["updated_at"] = now
+                if result is not None:
+                    task["last_result"] = result
+                    task["result"] = result
+                return
+    raise RuntimeError(f"未找到 TCC 任务: {task_id}")
+
+
+def record_tcc_task_failure(task_id, error_message, result=None):
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    with locked_tcc_registry() as data:
+        for task in data.get("tasks", []):
+            if task.get("id") == task_id:
+                retry_count = int(task.get("retry_count", 0)) + 1
+                task["retry_count"] = retry_count
+                task.setdefault("attempted_strategies", []).append(
+                    {
+                        "strategy": "execute",
+                        "error": error_message,
+                        "timestamp": now,
+                    }
+                )
+                task["updated_at"] = now
+                task["status"] = "failed" if retry_count >= int(task.get("max_retries", 5)) else "pending"
+                task["last_result"] = result or {"ok": False, "error": error_message}
+                return
+    raise RuntimeError(f"未找到 TCC 任务: {task_id}")
+
+
+def try_normalize_hk_symbol(symbol):
+    if symbol is None:
+        return None
+    text = str(symbol).strip().upper()
+    if not text:
+        return None
+    if text.startswith("HK."):
+        code = text.split(".", 1)[1].strip()
+    elif text.endswith(".HK"):
+        code = text.split(".", 1)[0].strip()
+    elif "." in text:
+        return None
+    else:
+        code = text
+    if not code.isdigit():
+        return None
+    return "HK." + code.zfill(5)
+
+
 def normalize_hk_symbol(symbol):
-    upper = symbol.upper()
-    if upper.startswith("HK."):
-        code = upper.split(".", 1)[1]
-        return "HK." + code.zfill(5)
+    normalized = try_normalize_hk_symbol(symbol)
+    if normalized:
+        return normalized
+    upper = str(symbol).upper()
     if "." in upper:
         json_out({"ok": False, "error": "仅支持港股代码，格式应为 HK.00700"}, 1)
-    return "HK." + upper.zfill(5)
+    json_out({"ok": False, "error": "股票代码必须为港股数字代码，格式应为 HK.00700"}, 1)
 
 
 def parse_float(value):
@@ -329,6 +493,15 @@ def compute_monthly_volatility(annualized_vol):
     return annualized_vol / (12 ** 0.5)
 
 
+def shrink_score_for_sample(raw_score, sample_size):
+    if raw_score is None:
+        return None
+    if sample_size <= 1:
+        return NEUTRAL_SCORE
+    confidence = clamp((sample_size - 1) / max(FULL_SAMPLE_SIZE - 1, 1), 0.0, 1.0)
+    return NEUTRAL_SCORE + (raw_score - NEUTRAL_SCORE) * confidence
+
+
 def percentile_scores(values, higher_better=True):
     valid = [(idx, v) for idx, v in enumerate(values) if v is not None]
     scores = [None] * len(values)
@@ -340,7 +513,7 @@ def percentile_scores(values, higher_better=True):
         score = rank / (n - 1) if n > 1 else 1.0
         if not higher_better:
             score = 1.0 - score
-        scores[idx] = score * 100
+        scores[idx] = shrink_score_for_sample(score * 100, n)
     return scores
 
 
@@ -351,17 +524,29 @@ def score_factor(rows, metric_keys, higher_better_map):
             metrics[key].append(row.get(key))
     scored = {key: percentile_scores(metrics[key], higher_better_map.get(key, True)) for key in metric_keys}
     factor_scores = []
+    factor_meta = []
     for idx in range(len(rows)):
         per_metric = []
+        valid_metric_count = 0
         for key in metric_keys:
             value = scored[key][idx]
             if value is not None:
+                valid_metric_count += 1
                 per_metric.append(value)
+            else:
+                per_metric.append(MISSING_METRIC_SCORE)
         if per_metric:
             factor_scores.append(sum(per_metric) / len(per_metric))
         else:
             factor_scores.append(None)
-    return factor_scores, scored
+        factor_meta.append(
+            {
+                "valid_metrics": valid_metric_count,
+                "total_metrics": len(metric_keys),
+                "coverage": valid_metric_count / len(metric_keys) if metric_keys else 0.0,
+            }
+        )
+    return factor_scores, scored, factor_meta
 
 
 def parse_weights(weights_str):
@@ -538,17 +723,7 @@ def is_trading_day(date_value, calendar):
 
 
 def normalize_hsi_symbol(value):
-    if value is None:
-        return None
-    text = str(value).strip().upper()
-    if text.startswith("HK."):
-        return normalize_hk_symbol(text)
-    if text.endswith(".HK"):
-        text = text.split(".", 1)[0]
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if not digits:
-        return None
-    return normalize_hk_symbol(digits)
+    return try_normalize_hk_symbol(value)
 
 
 def resolve_universe_cache_dir():
@@ -671,27 +846,21 @@ def add_user_stock(symbol, name=None, sector=None):
     auto_sector = sector
     
     if not auto_name or not auto_sector:
-        # 尝试从 Futu API 获取
+        for stock in data.get("hsi_stocks", []):
+            if try_normalize_hk_symbol(stock.get("code")) == norm_symbol:
+                auto_name = auto_name or stock.get("name")
+                auto_sector = auto_sector or stock.get("sector")
+                break
+    if not auto_name:
         try:
-            from futu import OpenQuoteContext
-            quote_ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
-            ret, plate_data = quote_ctx.get_stock_company(code=norm_symbol)
-            if ret == 0 and plate_data is not None and len(plate_data) > 0:
-                row = plate_data.iloc[0]
-                if not auto_name:
-                    auto_name = row.get('name') or row.get('stock_name') or norm_symbol
-                # 尝试获取行业板块
-                if not auto_sector:
-                    # 从 plate_list 获取行业信息
-                    ret2, plate_list = quote_ctx.get_plate_list(code=norm_symbol)
-                    if ret2 == 0 and plate_list is not None:
-                        plates = plate_list['plate_name'].tolist() if hasattr(plate_list, 'tolist') else []
-                        if plates:
-                            auto_sector = plates[0]  # 取第一个板块
-            quote_ctx.close()
+            payload = call_futu_skill(["quote", "--symbols", norm_symbol])
+            rows = payload.get("data") or []
+            if rows:
+                row = rows[0]
+                auto_name = row.get("name") or row.get("stock_name") or row.get("stock_name_cn")
         except Exception:
-            pass  # 自动获取失败时使用默认值
-    
+            pass
+
     # 添加到用户股票列表
     new_stock = {
         "code": norm_symbol,
@@ -714,10 +883,27 @@ def get_all_universe_symbols():
     data = load_universe_json()
     symbols = []
     for stock in data.get("hsi_stocks", []) + data.get("user_stocks", []):
-        code = stock.get("code")
+        code = try_normalize_hk_symbol(stock.get("code"))
         if code:
             symbols.append(code)
     return symbols
+
+
+def get_invalid_universe_stocks():
+    data = load_universe_json()
+    invalid = []
+    for section in ("hsi_stocks", "user_stocks"):
+        for stock in data.get(section, []):
+            code = stock.get("code")
+            if code and not try_normalize_hk_symbol(code):
+                invalid.append(
+                    {
+                        "section": section,
+                        "code": code,
+                        "name": stock.get("name"),
+                    }
+                )
+    return invalid
 
 
 def get_universe_by_sector():
@@ -861,12 +1047,20 @@ def load_universe_symbols(args):
         setattr(args, "_universe_meta", {"source": "manual"})
     normalized = []
     seen = set()
+    invalid_symbols = []
     for symbol in symbols:
-        norm = normalize_hk_symbol(symbol)
+        norm = try_normalize_hk_symbol(symbol)
+        if not norm:
+            invalid_symbols.append(symbol)
+            continue
         if norm in seen:
             continue
         seen.add(norm)
         normalized.append(norm)
+    if invalid_symbols:
+        meta = getattr(args, "_universe_meta", {})
+        meta["invalid_symbols"] = invalid_symbols
+        setattr(args, "_universe_meta", meta)
     return normalized
 
 
@@ -1763,14 +1957,23 @@ def screen_symbols(args):
         prices = extract_prices(kline_rows)
         indicator_rows = fetch_financial_indicators(norm_symbol, args.period, args.start, args.end)
         latest = extract_latest_row(indicator_rows)
-        roe = pick_metric(latest or {}, ["roe", "ROE", "净资产收益率(%)", "净资产收益率", "ROE(%)"])
-        gross_margin = pick_metric(latest or {}, ["gross_margin", "销售毛利率(%)", "毛利率", "毛利率(%)"])
+        roe = pick_metric(
+            latest or {},
+            ["roe", "ROE", "净资产收益率(%)", "净资产收益率", "ROE(%)", "股东权益回报率(%)"],
+        )
+        gross_margin = pick_metric(latest or {}, ["gross_margin", "销售毛利率(%)", "毛利率", "毛利率(%)", "毛利率TTM(%)"])
         net_margin = pick_metric(latest or {}, ["net_margin", "销售净利率(%)", "净利率", "净利率(%)"])
-        debt_ratio = pick_metric(latest or {}, ["debt_ratio", "资产负债率(%)", "资产负债率"])
-        revenue_growth = pick_metric(latest or {}, ["revenue_growth", "营业收入同比增长率(%)", "营业收入增长率"])
-        profit_growth = pick_metric(latest or {}, ["profit_growth", "净利润同比增长率(%)", "归母净利润同比增长率(%)"])
-        pe_ttm = pick_metric(latest or {}, ["pe_ttm", "PE_TTM", "市盈率(PE)", "市盈率", "PE"])
-        pb = pick_metric(latest or {}, ["pb", "PB", "市净率(PB)", "市净率"])
+        debt_ratio = pick_metric(latest or {}, ["debt_ratio", "资产负债率(%)", "资产负债率", "总负债/总资产(%)"])
+        revenue_growth = pick_metric(
+            latest or {},
+            ["revenue_growth", "营业收入同比增长率(%)", "营业收入增长率", "营业总收入滚动环比增长(%)"],
+        )
+        profit_growth = pick_metric(
+            latest or {},
+            ["profit_growth", "净利润同比增长率(%)", "归母净利润同比增长率(%)", "净利润滚动环比增长(%)"],
+        )
+        pe_ttm = pick_metric(latest or {}, ["pe_ttm", "PE_TTM", "市盈率(PE)", "市盈率", "PE", "市盈率TTM"])
+        pb = pick_metric(latest or {}, ["pb", "PB", "市净率(PB)", "市净率", "市账率"])
         returns_21 = compute_returns(prices, 21) if prices else None
         returns_63 = compute_returns(prices, 63) if prices else None
         returns_126 = compute_returns(prices, 126) if prices else None
@@ -1841,11 +2044,11 @@ def screen_symbols(args):
         "volatility_252d": False,
         "max_drawdown": False,
     }
-    quality_scores, quality_metric_scores = score_factor(rows, quality_metrics, higher_better)
-    growth_scores, growth_metric_scores = score_factor(rows, growth_metrics, higher_better)
-    valuation_scores, valuation_metric_scores = score_factor(rows, valuation_metrics, higher_better)
-    momentum_scores, momentum_metric_scores = score_factor(rows, momentum_metrics, higher_better)
-    risk_scores, risk_metric_scores = score_factor(rows, risk_metrics, higher_better)
+    quality_scores, quality_metric_scores, quality_meta = score_factor(rows, quality_metrics, higher_better)
+    growth_scores, growth_metric_scores, growth_meta = score_factor(rows, growth_metrics, higher_better)
+    valuation_scores, valuation_metric_scores, valuation_meta = score_factor(rows, valuation_metrics, higher_better)
+    momentum_scores, momentum_metric_scores, momentum_meta = score_factor(rows, momentum_metrics, higher_better)
+    risk_scores, risk_metric_scores, risk_meta = score_factor(rows, risk_metrics, higher_better)
     factor_map = {
         "quality": quality_scores,
         "growth": growth_scores,
@@ -1890,6 +2093,13 @@ def screen_symbols(args):
             "market": row["market"],
             "metrics": row,
             "scores": {**factor_scores, "overall": overall},
+            "score_meta": {
+                "quality": quality_meta[idx],
+                "growth": growth_meta[idx],
+                "valuation": valuation_meta[idx],
+                "momentum": momentum_meta[idx],
+                "risk": risk_meta[idx],
+            },
             "metric_scores": {
                 "quality": {k: quality_metric_scores[k][idx] for k in quality_metrics},
                 "growth": {k: growth_metric_scores[k][idx] for k in growth_metrics},
@@ -2171,6 +2381,7 @@ def output_workflow(_args):
 
 def manage_universe(args):
     """标的池管理命令"""
+    invalid_stocks = get_invalid_universe_stocks()
     # 初始化
     if getattr(args, "init", False):
         data = initialize_universe_json()
@@ -2225,7 +2436,11 @@ def manage_universe(args):
         sectors = get_universe_by_sector()
         json_out({
             "ok": True,
-            "data": {"sectors": sectors, "total": sum(len(v) for v in sectors.values())}
+            "data": {
+                "sectors": sectors,
+                "total": sum(len(v) for v in sectors.values()),
+                "invalid_stocks": invalid_stocks,
+            }
         })
     
     # 默认: 查看标的池
@@ -2240,7 +2455,8 @@ def manage_universe(args):
                 "user_count": data["stats"]["user_count"],
                 "total_count": data["stats"]["total_count"],
                 "hsi_refresh_date": data.get("hsi_refresh_date"),
-                "path": str(resolve_universe_json_path())
+                "path": str(resolve_universe_json_path()),
+                "invalid_stocks": invalid_stocks,
             }
         })
 
@@ -2295,8 +2511,111 @@ def auto_screen(args):
     json_out(payload)
 
 
+def build_tcc_result_payload(payload, command=None):
+    result = {
+        "ok": bool(payload.get("ok")),
+        "command": command,
+    }
+    if payload.get("error"):
+        result["error"] = payload.get("error")
+    if payload.get("message"):
+        result["message"] = payload.get("message")
+    data = payload.get("data") or {}
+    summary = data.get("summary")
+    if summary:
+        result["summary"] = summary
+    report = data.get("report") or {}
+    if report.get("path"):
+        result["report"] = {
+            "path": report.get("path"),
+            "delivered": report.get("delivered"),
+            "mode": report.get("mode"),
+        }
+    portfolio = data.get("portfolio") or {}
+    allocation = portfolio.get("allocation") or []
+    if allocation:
+        result["selected_symbols"] = [item.get("symbol") for item in allocation if item.get("symbol")]
+    trades = data.get("trades") or {}
+    orders = trades.get("orders") or []
+    if trades:
+        result["trades"] = {
+            "enabled": trades.get("enabled"),
+            "submitted": len([item for item in orders if item.get("status") == "submitted"]),
+            "failed": len([item for item in orders if item.get("status") == "failed"]),
+            "skipped": len([item for item in orders if item.get("status") == "skipped"]),
+        }
+    auto_ctx = data.get("auto") or {}
+    if auto_ctx:
+        result["auto"] = {
+            "universe_total": auto_ctx.get("universe_total"),
+            "signal_passed": auto_ctx.get("signal_passed"),
+        }
+    return result
+
+
+def payload_to_argv(task_id, payload):
+    if not isinstance(payload, dict):
+        raise RuntimeError("TCC payload 必须为 JSON 对象")
+    command = payload.get("command") or payload.get("subcommand") or payload.get("action")
+    if not command:
+        raise RuntimeError("TCC payload 缺少 command")
+    raw_args = payload.get("args") if isinstance(payload.get("args"), dict) else payload
+    ignore_keys = {
+        "command",
+        "subcommand",
+        "action",
+        "args",
+        "task_id",
+        "workflow_id",
+        "project_path",
+        "project_name",
+        "project_type",
+        "user_prompt",
+        "target_skill",
+    }
+    argv = ["--task_id", task_id, str(command)]
+    for key, value in raw_args.items():
+        if key in ignore_keys or value is None:
+            continue
+        option = f"--{str(key).replace('_', '-')}"
+        if isinstance(value, bool):
+            if value:
+                argv.append(option)
+            continue
+        argv.append(option)
+        if isinstance(value, (list, tuple)):
+            argv.extend(str(item) for item in value)
+        elif isinstance(value, dict):
+            argv.append(json.dumps(value, ensure_ascii=False))
+        else:
+            argv.append(str(value))
+    return argv
+
+
+def prepare_argv(argv):
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--task_id")
+    pre_parser.add_argument("--payload-json")
+    known, _ = pre_parser.parse_known_args(argv)
+    task_id = known.task_id
+    payload = {}
+    if known.payload_json:
+        payload = json.loads(known.payload_json)
+    if not task_id:
+        return argv, None, payload
+    task_payload = get_tcc_task_payload(task_id)
+    merged_payload = dict(task_payload)
+    merged_payload.update(payload)
+    commands = {"workflow", "universe", "schedule", "screen", "auto"}
+    if any(token in commands for token in argv):
+        return argv, task_id, merged_payload
+    return payload_to_argv(task_id, merged_payload), task_id, merged_payload
+
+
 def build_parser():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--task_id")
+    parser.add_argument("--payload-json")
     sub = parser.add_subparsers(dest="command", required=True)
     workflow = sub.add_parser("workflow")
     workflow.set_defaults(func=output_workflow)
@@ -2404,15 +2723,46 @@ def build_parser():
     return parser
 
 
-def main():
-    ensure_venv()
-    parser = build_parser()
-    args = parser.parse_args()
-    args.func(args)
+def main(argv=None):
+    global TCC_CAPTURE_MODE
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--task_id")
+    known, _ = pre_parser.parse_known_args(raw_argv)
+    task_id = known.task_id
+    TCC_CAPTURE_MODE = bool(task_id)
+    command = None
+    try:
+        prepared_argv, task_id, _task_payload = prepare_argv(raw_argv)
+        ensure_venv()
+        parser = build_parser()
+        args = parser.parse_args(prepared_argv)
+        command = getattr(args, "command", None)
+        args.func(args)
+        return 0
+    except SkillExit as exc:
+        if task_id:
+            result = build_tcc_result_payload(exc.payload, command)
+            if exc.exit_code == 0:
+                update_tcc_task_status(task_id, "completed", result)
+            else:
+                error_message = exc.payload.get("error") if isinstance(exc.payload, dict) else str(exc)
+                record_tcc_task_failure(task_id, error_message or "skill_failed", result)
+        return exc.exit_code
+    except SystemExit as exc:
+        exit_code = exc.code if isinstance(exc.code, int) else 1
+        if task_id and exit_code != 0:
+            error_payload = {"ok": False, "error": "参数解析失败"}
+            record_tcc_task_failure(task_id, error_payload["error"], build_tcc_result_payload(error_payload, command))
+        return exit_code
+    except Exception as exc:
+        payload = {"ok": False, "error": str(exc)}
+        print(json.dumps(payload, ensure_ascii=False))
+        if task_id:
+            record_tcc_task_failure(task_id, str(exc), build_tcc_result_payload(payload, command))
+            return 1
+        return 1
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        json_out({"ok": False, "error": str(exc)}, 1)
+    raise SystemExit(main())

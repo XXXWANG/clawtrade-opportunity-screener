@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "description": "港股标的池 - 恒生指数成分股",
-  "last_updated": "2026-03-07 23:30:03",
+  "last_updated": "2026-03-10 10:01:00",
   "hsi_stocks": [
     {
       "code": "HK.00700",
@@ -154,26 +154,11 @@
       "sector": "通信"
     }
   ],
-  "user_stocks": [
-    {
-      "code": "HK.0理想汽车",
-      "name": "HK.0理想汽车",
-      "sector": "用户自定义",
-      "added_date": "2026-03-07",
-      "source": "user"
-    },
-    {
-      "code": "HK.00NIO",
-      "name": "NIO蔚来",
-      "sector": "用户自定义",
-      "added_date": "2026-03-07",
-      "source": "user"
-    }
-  ],
+  "user_stocks": [],
   "hsi_refresh_date": "2026-03-07",
   "stats": {
     "hsi_count": 30,
-    "user_count": 2,
-    "total_count": 32
+    "user_count": 0,
+    "total_count": 30
   }
 }
