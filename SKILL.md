@@ -1,6 +1,6 @@
 ---
 name: clawtrade-opportunity-screener
-description: 港股多因子机会筛选、自动筛选、组合建议与 TCC 兼容调度执行
+description: 港股多因子机会筛选、真实信息面整合（新闻/公告/财报日历）、组合建议与 TCC 兼容调度执行
 metadata: {"openclaw":{"requires":{"bins":["python3"]},"os":["darwin","linux","win32"]}}
 ---
 
@@ -8,7 +8,7 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]},"os":["darwin","linux","w
 
 当用户需要进行港股机会筛选与识别时，调用此技能。使用本技能时：
 - 统一通过 {baseDir}/screener_skill.py 执行
-- 数据源为 clawtrade-futu-paper-trade 技能（futu-api）
+- 数据源为 clawtrade-futu-paper-trade 技能（futu-api）+ Google News RSS + HKEX News
 - 需要本地 FutuOpenD 处于运行状态
 - 支持 direct CLI 和 TCC `--task_id` 两种运行模式
 
@@ -43,6 +43,32 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]},"os":["darwin","linux","w
   python3 {baseDir}/screener_skill.py screen --symbols HK.00700 --weights '{"quality":0.35,"growth":0.25,"valuation":0.2,"momentum":0.1,"risk":0.1}'
 - 自定义阈值：
   python3 {baseDir}/screener_skill.py screen --symbols HK.00700 --thresholds '{"overall":60,"quality":55,"growth":50,"valuation":40,"momentum":50,"risk":40}'
+- 信息面增强筛选：
+  python3 {baseDir}/screener_skill.py screen --symbols HK.00700 HK.09988 --news-lookback-days 14 --announcement-lookback-days 30 --earnings-lookahead-days 120
+- 关闭信息面：
+  python3 {baseDir}/screener_skill.py screen --symbols HK.00700 --disable-information
+- 查看已注册计划任务：
+  python3 {baseDir}/screener_skill.py run-scheduled --list
+- 执行独立补发任务：
+  python3 {baseDir}/screener_skill.py run-scheduled --job delivery_retry
+- 执行固定时段报告任务：
+  python3 {baseDir}/screener_skill.py run-scheduled --job pre_open
+- 查看计划任务执行记录：
+  python3 {baseDir}/screener_skill.py scheduled-runs --limit 10
+- 导出 cron 调度文件：
+  python3 {baseDir}/screener_skill.py cron-export
+- 安装当前用户 cron：
+  python3 {baseDir}/screener_skill.py cron-install
+- 查看或修改汇报时间偏好：
+  python3 {baseDir}/screener_skill.py schedule-preferences --view
+  python3 {baseDir}/screener_skill.py schedule-preferences --profile compact
+  python3 {baseDir}/screener_skill.py schedule-preferences --report-times '{"post_close":"17:00","night_review":"21:00"}'
+- 导出 OpenClaw automation 规格：
+  python3 {baseDir}/screener_skill.py openclaw-automation-spec
+- 输出面向用户的汇报设置摘要：
+  python3 {baseDir}/screener_skill.py report-settings --format markdown
+- 直接解析用户一句话的汇报设置请求：
+  python3 {baseDir}/screener_skill.py report-settings-request --message "关闭午间报告，把夜间复盘改到21:30"
 
 目标约束参数
 - monthly-target：月度目标收益，默认 0.01
@@ -79,10 +105,24 @@ metadata: {"openclaw":{"requires":{"bins":["python3"]},"os":["darwin","linux","w
 - collect：包含价格回溯摘要与财务快照
 - review：包含筛选结果与目标偏差复盘
 
+信息面参数
+- disable-information：关闭新闻、公告、财报日历抓取
+- news-lookback-days：新闻回看天数，默认 14
+- news-limit：每只股票保留新闻条数，默认 5
+- announcement-lookback-days：公告回看天数，默认 30
+- announcement-limit：每只股票保留公告条数，默认 6
+- earnings-lookahead-days：财报/董事会会议日历前瞻天数，默认 120
+
 输出说明
 - 所有输出为 JSON
+- `screened[*].information` 包含新闻、公告和财报日历快照
 - 失败时返回 error 字段，包含原因与建议
 - TCC 模式下会按协议从 `global_tasks.json` 读取 payload，并在完成后回写 `completed` / `pending` / `failed`
+- cron / automation 场景应统一通过 `run-scheduled --job <job_id>` 触发，且会自动携带 `SCREENER_RUN_CONTEXT=scheduled`
+- `screen` / `auto` / `report-retry` 与 TCC 共用运行锁，计划任务在冲突时会跳过，不会与 TCC 并发执行
+- OpenClaw automation 适用于固定时点报告；高频 `delivery_retry` 继续通过 cron fallback 运行
+- 用户侧目前没有独立 GUI 设置页；推荐入口是主 agent 对话，随后由 agent 更新偏好并同步 OpenClaw automation 卡片
+- 如需把用户自然语言直接映射成设置更新，优先使用 `report-settings-request --message ...`
 
 TCC payload 约定
 - payload 需包含 `command`

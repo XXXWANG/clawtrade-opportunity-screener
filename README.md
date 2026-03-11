@@ -9,6 +9,11 @@
 
 **一句话概括：用多因子模型帮 OpenClaw 筛选出会上涨的港股。**
 
+现在已接入真实信息面：
+- Google News RSS：公司相关新闻流
+- HKEX Title Search：公司正式公告
+- HKEX Board Meeting Notifications：财报/业绩日历
+
 ---
 
 ## 🎯 核心理念
@@ -54,6 +59,24 @@ python screener_skill.py screen --enforce-target
 # 5. 自定义权重
 python screener_skill.py screen --symbols HK.00700 \
   --weights '{"quality":0.35,"growth":0.25,"valuation":0.2,"momentum":0.1,"risk":0.1}'
+
+# 6. 接入真实信息面
+python screener_skill.py screen --symbols HK.00700 HK.09988 \
+  --news-lookback-days 14 --announcement-lookback-days 30 --earnings-lookahead-days 120
+
+# 7. 查看历史报告和重试队列
+python screener_skill.py reports --delivery-status failed --include-retry-queue --limit 10
+python screener_skill.py report-retry --view --due-only --limit 10
+python screener_skill.py report-retry --all-due --limit 10
+python screener_skill.py run-scheduled --list
+python screener_skill.py run-scheduled --job delivery_retry
+python screener_skill.py scheduled-runs --limit 10
+python screener_skill.py cron-export
+python screener_skill.py cron-install
+python screener_skill.py schedule-preferences --view
+python screener_skill.py openclaw-automation-spec
+python screener_skill.py report-settings --format markdown
+python screener_skill.py report-settings-request --message "关闭午间报告，把夜间复盘改到21:30"
 ```
 
 ---
@@ -74,7 +97,14 @@ python screener_skill.py screen --symbols HK.00700 \
   },
   "recommendation": "BUY",
   "target_return": 0.025,
-  "risk_level": "MEDIUM"
+  "risk_level": "MEDIUM",
+  "information": {
+    "score": 63.5,
+    "risk_flags": ["earnings_window_7d"],
+    "news": {"items": []},
+    "announcements": {"items": []},
+    "earnings_calendar": {"items": []}
+  }
 }
 ```
 
@@ -131,12 +161,49 @@ python screener_skill.py screen --symbols HK.00700 \
 | `--dynamic-threshold` | 动态调整阈值 | false |
 | `--enforce-target` | 强制达标才推荐 | false |
 | `--max-position` | 单票最大仓位 | 15% |
+| `--disable-information` | 关闭新闻/公告/财报日历 | false |
+| `--news-lookback-days` | 新闻回看窗口 | 14 |
+| `--announcement-lookback-days` | 公告回看窗口 | 30 |
+| `--earnings-lookahead-days` | 财报日历前瞻窗口 | 120 |
+| `--disable-retry-drain` | 关闭主流程前的到期补发处理 | false |
+| `--retry-due-limit` | 每次主流程预处理的到期补发上限 | 5 |
 
 ### 组合约束
 | 参数 | 说明 | 示例 |
 |------|------|------|
 | `--sector-map` | 行业映射 | `'{"HK.00700":"互联网"}'` |
 | `--sector-caps` | 行业上限 | `'{"互联网":0.3}'` |
+
+### 报告回看与补发
+| 命令 | 说明 |
+|------|------|
+| `reports --include-retry-queue` | 历史报告附带当前补发队列状态 |
+| `report-retry --view --due-only` | 查看已到补发时间的报告 |
+| `report-retry --all-due --limit 10` | 独立执行一次到期补发 |
+| `scheduled-runs --limit 10` | 查看计划任务执行留痕 |
+| `cron-export` | 导出外部 cron 可直接消费的调度文件 |
+| `cron-install` | 安装或更新当前用户 crontab 中的 ClawTrade managed block |
+| `schedule-preferences --view` | 查看或修改用户汇报时间偏好 |
+| `openclaw-automation-spec` | 导出可映射到 OpenClaw automation 的固定报告任务 |
+| `report-settings --format markdown` | 输出面向用户的汇报设置摘要与接触路径说明 |
+| `report-settings-request --message "..."` | 解析用户自然语言汇报设置请求，并输出新的摘要与 automation 计划 |
+
+### 日程输出
+
+`schedule` 现在除固定时段报告外，还会输出一条独立维护任务：
+
+- `delivery_retry`：默认 `08:35-21:05` 每 `5` 分钟执行一次
+- 命令：`python3 {baseDir}/screener_skill.py run-scheduled --job delivery_retry`
+- 可通过 `--retry-schedule-start`、`--retry-schedule-end`、`--retry-schedule-interval`、`--retry-limit` 调整
+- 固定报告也统一走 `run-scheduled --job pre_open|pre_trade|midday|pre_close_risk|post_close|night_review`
+- 每次 `run-scheduled` 执行都会留痕到 `HKAutoTradeReports/index/scheduled_run_log.json`
+- `schedule.json` 额外提供扁平 `jobs` 列表，便于外部调度器直接消费
+- `cron-export` 会生成 [HKAutoTradeReports/cron/clawtrade_schedule.cron](/Users/heatherli/Desktop/ClawSkillsDev/Clawtrade-opportunity-screener_Project/HKAutoTradeReports/cron/clawtrade_schedule.cron)
+- 导出的 cron 会自动带 `SCREENER_RUN_CONTEXT=scheduled`，并与 TCC/手动执行共用运行锁，避免并发冲突
+- `openclaw-automation-spec` 只导出固定时点报告任务；`delivery_retry` 因为是 5 分钟级别维护任务，不适合当前 OpenClaw automation RRULE 能力，继续保留 cron fallback
+- 用户如不接受默认汇报时间，可用 `schedule-preferences --profile compact|minimal` 或 `--report-times '{"post_close":"17:00"}'` 调整后再重新生成 automation / cron
+- 当前没有单独的 GUI 设置页；用户入口是“对话改偏好 + OpenClaw automation 卡片确认”，可用 `report-settings` 输出当前生效摘要
+- 主 agent 如需直接承接用户原话，可调用 `report-settings-request --message "只保留盘前和收盘后两份"`，让 skill 自动更新偏好并生成新的 automation 计划
 
 ---
 

@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Portfolio Survival Manager Window Settlement",
+  "type": "object",
+  "required": [
+    "window_id",
+    "settled_at",
+    "start_nav",
+    "end_nav",
+    "window_return_pct",
+    "survived",
+    "survival_floor_pct",
+    "stretch_target_pct",
+    "next_window_start_nav",
+    "life_extension_days"
+  ],
+  "properties": {
+    "window_id": {
+      "type": "string"
+    },
+    "settled_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "start_nav": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "end_nav": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "window_return_pct": {
+      "type": "number"
+    },
+    "survival_floor_pct": {
+      "type": "number"
+    },
+    "stretch_target_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "survived": {
+      "type": "boolean"
+    },
+    "passed_stretch": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "extra_life_units": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "life_extension_days": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "next_window_start_nav": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "closing_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "survived",
+        "failed_survival_floor",
+        "manual_reset",
+        null
+      ]
+    },
+    "summary": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "additionalProperties": false
+}

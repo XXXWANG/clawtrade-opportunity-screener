@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClawTrade Reports Manifest",
+  "type": "object",
+  "required": [
+    "version",
+    "updated_at",
+    "entries"
+  ],
+  "properties": {
+    "version": {
+      "type": "string"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "report_id",
+          "report_type",
+          "report_date",
+          "as_of",
+          "symbols",
+          "version",
+          "delivery_status",
+          "json_path",
+          "markdown_path",
+          "created_at"
+        ],
+        "properties": {
+          "report_id": {
+            "type": "string"
+          },
+          "parent_report_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "report_type": {
+            "type": "string",
+            "enum": [
+              "ad_hoc_screen",
+              "pre_open",
+              "pre_trade",
+              "midday",
+              "pre_close_risk",
+              "post_close",
+              "night_review",
+              "event_alert",
+              "settlement"
+            ]
+          },
+          "trigger_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "scheduled",
+              "event_driven",
+              "manual",
+              "retry",
+              null
+            ]
+          },
+          "report_date": {
+            "type": "string",
+            "format": "date"
+          },
+          "as_of": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "window_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "symbols": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "decision_tag": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "risk_mode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "defense",
+              "balanced",
+              "attack",
+              "lockdown",
+              null
+            ]
+          },
+          "window_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "ahead",
+              "on_track",
+              "behind",
+              "settled",
+              null
+            ]
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "delivery_attempt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "delivery_status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "sent",
+              "failed",
+              "skipped"
+            ]
+          },
+          "json_path": {
+            "type": "string"
+          },
+          "markdown_path": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "sent_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

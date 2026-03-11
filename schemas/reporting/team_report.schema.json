@@ -1,0 +1,492 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ClawTrade Team Report",
+  "type": "object",
+  "required": [
+    "meta",
+    "context",
+    "executive_summary",
+    "market_update",
+    "portfolio_update",
+    "risk_update",
+    "next_actions",
+    "delivery"
+  ],
+  "properties": {
+    "meta": {
+      "type": "object",
+      "required": [
+        "report_id",
+        "report_type",
+        "trigger_type",
+        "version",
+        "created_at",
+        "as_of"
+      ],
+      "properties": {
+        "report_id": {
+          "type": "string"
+        },
+        "parent_report_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "draft_bundle_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "report_type": {
+          "type": "string",
+          "enum": [
+            "ad_hoc_screen",
+            "pre_open",
+            "pre_trade",
+            "midday",
+            "pre_close_risk",
+            "post_close",
+            "night_review",
+            "event_alert",
+            "settlement"
+          ]
+        },
+        "trigger_type": {
+          "type": "string",
+          "enum": [
+            "scheduled",
+            "event_driven",
+            "manual",
+            "retry"
+          ]
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "delivery_attempt": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "as_of": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "context": {
+      "type": "object",
+      "required": [
+        "window_id",
+        "symbols",
+        "portfolio_state"
+      ],
+      "properties": {
+        "window_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workflow_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "symbols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "portfolio_state": {
+          "type": "object",
+          "required": [
+            "nav",
+            "cash_ratio_pct",
+            "gross_exposure_pct",
+            "position_count"
+          ],
+          "properties": {
+            "nav": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "cash_ratio_pct": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "gross_exposure_pct": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "net_exposure_pct": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "position_count": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "source_refs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "source_type",
+              "ref_id"
+            ],
+            "properties": {
+              "source_type": {
+                "type": "string"
+              },
+              "ref_id": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "executive_summary": {
+      "type": "object",
+      "required": [
+        "headline",
+        "decision_summary",
+        "risk_summary"
+      ],
+      "properties": {
+        "headline": {
+          "type": "string"
+        },
+        "decision_summary": {
+          "type": "string"
+        },
+        "risk_summary": {
+          "type": "string"
+        },
+        "status_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "market_update": {
+      "type": "object",
+      "required": [
+        "market_regime",
+        "highlights"
+      ],
+      "properties": {
+        "market_regime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "risk_on",
+            "neutral",
+            "risk_off",
+            null
+          ]
+        },
+        "highlights": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "event_flags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "watchlist_changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "symbol",
+              "change_type",
+              "reason"
+            ],
+            "properties": {
+              "symbol": {
+                "type": "string"
+              },
+              "change_type": {
+                "type": "string",
+                "enum": [
+                  "added",
+                  "removed",
+                  "upgraded",
+                  "downgraded",
+                  "unchanged"
+                ]
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "portfolio_update": {
+      "type": "object",
+      "required": [
+        "actions",
+        "positions_snapshot"
+      ],
+      "properties": {
+        "actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "action_type",
+              "summary"
+            ],
+            "properties": {
+              "action_type": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "increase",
+                  "reduce",
+                  "close",
+                  "hold",
+                  "cancel",
+                  "no_action"
+                ]
+              },
+              "symbol": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "summary": {
+                "type": "string"
+              },
+              "planned_weight_pct": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "filled_weight_pct": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "positions_snapshot": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "symbol",
+              "weight_pct"
+            ],
+            "properties": {
+              "symbol": {
+                "type": "string"
+              },
+              "weight_pct": {
+                "type": "number"
+              },
+              "pnl_pct": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "orders_snapshot": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "order_id",
+              "status"
+            ],
+            "properties": {
+              "order_id": {
+                "type": "string"
+              },
+              "symbol": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "planned",
+                  "submitted",
+                  "partial_fill",
+                  "filled",
+                  "cancelled",
+                  "rejected",
+                  "failed"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "risk_update": {
+      "type": "object",
+      "required": [
+        "risk_mode",
+        "top_risks"
+      ],
+      "properties": {
+        "risk_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "defense",
+            "balanced",
+            "attack",
+            "lockdown",
+            null
+          ]
+        },
+        "window_status": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "ahead",
+            "on_track",
+            "behind",
+            "settled",
+            null
+          ]
+        },
+        "top_risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "alerts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "next_actions": {
+      "type": "object",
+      "required": [
+        "action_items"
+      ],
+      "properties": {
+        "action_items": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "next_report_time": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    },
+    "delivery": {
+      "type": "object",
+      "required": [
+        "delivery_status"
+      ],
+      "properties": {
+        "delivery_status": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "sent",
+            "failed",
+            "skipped"
+          ]
+        },
+        "delivery_channel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sent_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Portfolio Survival Manager Decision",
+  "type": "object",
+  "required": [
+    "decision_id",
+    "request_id",
+    "generated_at",
+    "window_id",
+    "window_status",
+    "risk_mode",
+    "allow_trading",
+    "block_new_risk",
+    "enter_lockdown",
+    "target_gross_exposure_pct",
+    "target_cash_ratio_pct",
+    "accepted_candidates",
+    "rejected_candidates",
+    "target_allocations",
+    "execution_constraints",
+    "reasoning_summary"
+  ],
+  "properties": {
+    "decision_id": {
+      "type": "string"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "workflow_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "window_id": {
+      "type": "string"
+    },
+    "window_status": {
+      "type": "string",
+      "enum": [
+        "ahead",
+        "on_track",
+        "behind"
+      ]
+    },
+    "risk_mode": {
+      "type": "string",
+      "enum": [
+        "defense",
+        "balanced",
+        "attack",
+        "lockdown"
+      ]
+    },
+    "allow_trading": {
+      "type": "boolean"
+    },
+    "block_new_risk": {
+      "type": "boolean"
+    },
+    "enter_lockdown": {
+      "type": "boolean"
+    },
+    "allow_exit_only": {
+      "type": "boolean"
+    },
+    "target_gross_exposure_pct": {
+      "type": "number"
+    },
+    "target_net_exposure_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "target_cash_ratio_pct": {
+      "type": "number"
+    },
+    "single_position_cap_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "new_risk_budget_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "accepted_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "target_weight_pct",
+          "reason"
+        ],
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "target_weight_pct": {
+            "type": "number"
+          },
+          "max_entry_slippage_bps": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "rejected_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "reason"
+        ],
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "target_allocations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "action",
+          "target_weight_pct"
+        ],
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "open",
+              "increase",
+              "hold",
+              "reduce",
+              "close"
+            ]
+          },
+          "target_weight_pct": {
+            "type": "number"
+          },
+          "priority": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "thesis": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "execution_constraints": {
+      "type": "object",
+      "required": [
+        "max_orders",
+        "allow_opening_orders",
+        "allow_closing_orders"
+      ],
+      "properties": {
+        "max_orders": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "allow_opening_orders": {
+          "type": "boolean"
+        },
+        "allow_closing_orders": {
+          "type": "boolean"
+        },
+        "must_reduce_before_close": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "block_high_event_risk_names": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "preferred_order_style": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "marketable_limit",
+            "passive_limit",
+            "staged_limit",
+            null
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "reasoning_summary": {
+      "type": "string"
+    },
+    "decision_tags": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "additionalProperties": false
+}

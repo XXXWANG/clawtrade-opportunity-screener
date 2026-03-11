@@ -1,0 +1,330 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Portfolio Survival Manager Decision Request",
+  "type": "object",
+  "required": [
+    "request_id",
+    "requested_at",
+    "window_state",
+    "portfolio_snapshot",
+    "candidates",
+    "market_context",
+    "risk_limits"
+  ],
+  "properties": {
+    "request_id": {
+      "type": "string"
+    },
+    "requested_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "workflow_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "task_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "window_state": {
+      "$ref": "./window_state.schema.json"
+    },
+    "portfolio_snapshot": {
+      "type": "object",
+      "required": [
+        "cash",
+        "gross_exposure_pct",
+        "net_exposure_pct",
+        "positions"
+      ],
+      "properties": {
+        "cash": {
+          "type": "number"
+        },
+        "cash_ratio_pct": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "gross_exposure_pct": {
+          "type": "number"
+        },
+        "net_exposure_pct": {
+          "type": "number"
+        },
+        "realized_pnl": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "unrealized_pnl": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "positions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "symbol",
+              "side",
+              "market_value",
+              "weight_pct",
+              "unrealized_return_pct"
+            ],
+            "properties": {
+              "symbol": {
+                "type": "string"
+              },
+              "side": {
+                "type": "string",
+                "enum": [
+                  "long",
+                  "short"
+                ]
+              },
+              "quantity": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "avg_price": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "last_price": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "market_value": {
+                "type": "number"
+              },
+              "weight_pct": {
+                "type": "number"
+              },
+              "unrealized_return_pct": {
+                "type": "number"
+              },
+              "days_held": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 0
+              },
+              "event_risk": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "symbol",
+          "rank",
+          "confidence",
+          "thesis"
+        ],
+        "properties": {
+          "symbol": {
+            "type": "string"
+          },
+          "rank": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "confidence": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1
+          },
+          "quality_score": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "timing_score": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "alpha_score": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "expected_holding_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "thesis": {
+            "type": "string"
+          },
+          "invalid_reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "event_tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "market_context": {
+      "type": "object",
+      "required": [
+        "market_regime"
+      ],
+      "properties": {
+        "market_regime": {
+          "type": "string",
+          "enum": [
+            "risk_on",
+            "neutral",
+            "risk_off"
+          ]
+        },
+        "volatility_regime": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "normal",
+            "high",
+            null
+          ]
+        },
+        "macro_risk_level": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            null
+          ]
+        },
+        "event_risk_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "intel_summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "risk_limits": {
+      "type": "object",
+      "required": [
+        "max_gross_exposure_pct",
+        "max_single_position_pct",
+        "min_cash_ratio_pct",
+        "max_portfolio_drawdown_pct"
+      ],
+      "properties": {
+        "max_gross_exposure_pct": {
+          "type": "number"
+        },
+        "max_single_position_pct": {
+          "type": "number"
+        },
+        "min_cash_ratio_pct": {
+          "type": "number"
+        },
+        "max_portfolio_drawdown_pct": {
+          "type": "number"
+        },
+        "lockdown_trigger_buffer_pct": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "settlement_defense_days": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "history_context": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "recent_window_returns_pct": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "recent_hit_ratio": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "notes": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

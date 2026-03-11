@@ -1,20 +1,126 @@
 import argparse
+import copy
+import errno
+import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
+from urllib.parse import quote, urlencode, urljoin
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
+from bs4 import BeautifulSoup
+from reporting_runtime import (
+    archive_team_report,
+    build_screener_team_report,
+    detect_event_alerts,
+    iso_utc_now,
+    list_retry_queue,
+    load_json_file,
+    remove_retry_queue_entry,
+    save_json_file,
+    upsert_retry_queue_entry,
+    pick_report_profile,
+    query_report_history,
+    read_report_content,
+    update_archived_report_delivery,
+)
 
 
 TCC_CAPTURE_MODE = False
 NEUTRAL_SCORE = 50.0
 MISSING_METRIC_SCORE = 40.0
 FULL_SAMPLE_SIZE = 5
+HTTP_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    )
+}
+HKEX_STOCK_LOOKUP_CACHE = {}
+HKEX_BOARD_MEETING_CACHE = {}
+NEWS_POSITIVE_KEYWORDS = (
+    "beat",
+    "beats",
+    "growth",
+    "launch",
+    "partner",
+    "partnership",
+    "approval",
+    "record",
+    "buyback",
+    "dividend",
+    "upgrade",
+    "expand",
+    "strong",
+    "rebound",
+    "surge",
+    "jump",
+    "rise",
+    "bullish",
+    "investment",
+)
+NEWS_NEGATIVE_KEYWORDS = (
+    "warning",
+    "lawsuit",
+    "probe",
+    "investigation",
+    "decline",
+    "drop",
+    "fall",
+    "cut",
+    "downgrade",
+    "delay",
+    "suspension",
+    "winding up",
+    "liquidation",
+    "fraud",
+    "regulatory",
+    "antitrust",
+    "miss",
+    "sell-off",
+    "loss",
+    "weak",
+)
+ANNOUNCEMENT_POSITIVE_KEYWORDS = (
+    "final results",
+    "interim results",
+    "dividend",
+    "special dividend",
+    "share buyback",
+    "business update",
+    "voluntary announcement",
+    "contract",
+    "partnership",
+    "strategic",
+)
+ANNOUNCEMENT_NEGATIVE_KEYWORDS = (
+    "profit warning",
+    "inside information",
+    "delay in publication",
+    "suspension",
+    "winding up",
+    "liquidation",
+    "resignation",
+    "non-compliance",
+    "audit issues",
+    "modified report by auditors",
+)
+ANNOUNCEMENT_NOISE_KEYWORDS = (
+    "monthly returns",
+    "next day disclosure returns",
+    "disclosure of interests",
+    "list of directors",
+)
 
 
 class SkillExit(Exception):
@@ -48,6 +154,64 @@ def json_out(payload, exit_code=0):
     if TCC_CAPTURE_MODE:
         raise SkillExit(payload, exit_code)
     sys.exit(exit_code)
+
+
+def get_execution_owner(task_id=None):
+    if os.environ.get("SCREENER_RUN_CONTEXT") == "scheduled":
+        return "scheduled"
+    if task_id:
+        return "tcc"
+    return "cli"
+
+
+def resolve_execution_lock_path():
+    target = get_report_root() / "index" / "runtime_execution.lock"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+@contextmanager
+def runtime_execution_lock(command=None, task_id=None):
+    lock_commands = {"screen", "auto", "report-retry"}
+    if command not in lock_commands:
+        yield
+        return
+    owner = get_execution_owner(task_id)
+    lock_path = resolve_execution_lock_path()
+    lock_handle = lock_path.open("a+", encoding="utf-8")
+    lock_acquired = False
+    try:
+        if not sys.platform.startswith("win"):
+            import fcntl
+
+            flags = fcntl.LOCK_EX
+            if owner == "scheduled":
+                flags |= fcntl.LOCK_NB
+            try:
+                fcntl.flock(lock_handle.fileno(), flags)
+                lock_acquired = True
+            except OSError as exc:
+                if owner == "scheduled" and exc.errno in (errno.EACCES, errno.EAGAIN):
+                    json_out(
+                        {
+                            "ok": True,
+                            "data": {
+                                "skipped": True,
+                                "reason": "execution_locked",
+                                "command": command,
+                                "owner": owner,
+                                "lock_path": str(lock_path),
+                            },
+                        }
+                    )
+                raise
+        yield
+    finally:
+        if lock_acquired and not sys.platform.startswith("win"):
+            import fcntl
+
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
 
 
 def get_python_version(python_cmd):
@@ -133,7 +297,7 @@ def ensure_venv():
 
 def resolve_futu_skill_path():
     env_path = os.environ.get("FUTU_PAPER_TRADE_DIR") or os.environ.get("FUTU_PAPER_TRADE_PATH")
-    script_names = ("futu_skill.py", "xtrade_futu_skill.py")
+    script_names = ("clawtrade_futu_skill.py", "futu_skill.py", "xtrade_futu_skill.py")
     base_dir = Path(__file__).resolve().parent
     candidate_dirs = []
     if env_path:
@@ -201,6 +365,29 @@ def call_futu_skill(args):
         json_out({"ok": False, "error": "clawtrade-futu-paper-trade 返回内容无法解析"}, 1)
     if not payload.get("ok"):
         json_out(payload, 1)
+    return payload
+
+
+def call_futu_skill_safe(args):
+    script = resolve_futu_skill_path()
+    python_cmd = select_python()
+    env = os.environ.copy()
+    env.setdefault("FUTU_TRD_MARKET", "HK")
+    try:
+        output = subprocess.check_output(
+            [python_cmd, str(script), *args],
+            text=True,
+            stderr=subprocess.STDOUT,
+            env=env,
+        )
+    except subprocess.CalledProcessError as exc:
+        payload = read_json_output(exc.output or "")
+        if payload:
+            return payload
+        return {"ok": False, "error": exc.output.strip() or "clawtrade-futu-paper-trade 调用失败"}
+    payload = read_json_output(output)
+    if not payload:
+        return {"ok": False, "error": "clawtrade-futu-paper-trade 返回内容无法解析"}
     return payload
 
 
@@ -445,6 +632,405 @@ def fetch_financial_indicators(symbol, period, start, end):
     return []
 
 
+def fetch_text(url, params=None, timeout=20):
+    target = url
+    if params:
+        target = f"{url}?{urlencode(params)}"
+    request = Request(target, headers=HTTP_HEADERS)
+    with urlopen(request, timeout=timeout) as response:
+        content = response.read()
+        charset = response.headers.get_content_charset() or "utf-8"
+    return content.decode(charset, errors="ignore")
+
+
+def parse_jsonp_payload(text):
+    start = text.find("(")
+    end = text.rfind(")")
+    if start == -1 or end == -1 or end <= start:
+        return {}
+    try:
+        return json.loads(text[start + 1 : end])
+    except Exception:
+        return {}
+
+
+def normalize_symbol_digits(symbol):
+    return normalize_hk_symbol(symbol).split(".", 1)[1]
+
+
+def safe_parse_datetime(value, formats):
+    if not value:
+        return None
+    text = str(value).strip()
+    for fmt in formats:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def derive_company_aliases(company_name, fallback_code):
+    aliases = []
+    for raw in (company_name, fallback_code, str(int(fallback_code)) if fallback_code else None):
+        text = str(raw).strip() if raw is not None else ""
+        if not text:
+            continue
+        aliases.append(text)
+    upper_name = (str(company_name or "")).upper()
+    removable = (" HOLDINGS", " GROUP", " LTD", " LIMITED", " INC", " CORP", "-W", "-SW", "-B")
+    for token in removable:
+        if upper_name.endswith(token):
+            aliases.append(upper_name[: -len(token)].strip())
+    cleaned = []
+    seen = set()
+    for item in aliases:
+        key = item.upper()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(item)
+    return cleaned
+
+
+def text_mentions_company(text, aliases, symbol_digits):
+    haystack = (text or "").upper()
+    if not haystack:
+        return False
+    if symbol_digits and symbol_digits in haystack:
+        return True
+    if symbol_digits:
+        short_code = str(int(symbol_digits))
+        if f"SEHK:{short_code}" in haystack or f"HK:{short_code}" in haystack:
+            return True
+    for alias in aliases:
+        alias_upper = alias.upper().strip()
+        if not alias_upper:
+            continue
+        if alias_upper in haystack:
+            return True
+    return False
+
+
+def classify_text_signal(text, positive_keywords, negative_keywords):
+    lowered = (text or "").lower()
+    if not lowered:
+        return "neutral"
+    negative_hits = sum(1 for item in negative_keywords if item in lowered)
+    positive_hits = sum(1 for item in positive_keywords if item in lowered)
+    if negative_hits > positive_hits and negative_hits > 0:
+        return "negative"
+    if positive_hits > negative_hits and positive_hits > 0:
+        return "positive"
+    return "neutral"
+
+
+def fetch_hkex_stock_lookup(symbol, company_name=None):
+    symbol_digits = normalize_symbol_digits(symbol)
+    if symbol_digits in HKEX_STOCK_LOOKUP_CACHE:
+        return HKEX_STOCK_LOOKUP_CACHE[symbol_digits]
+    queries = [
+        str(int(symbol_digits)),
+        company_name,
+        f"{int(symbol_digits)} {company_name}" if company_name else None,
+    ]
+    for query in queries:
+        if not query:
+            continue
+        try:
+            text = fetch_text(
+                "https://www1.hkexnews.hk/search/prefix.do",
+                params={
+                    "callback": "callback",
+                    "lang": "EN",
+                    "type": "A",
+                    "name": query,
+                    "market": "SEHK",
+                },
+            )
+        except Exception:
+            continue
+        payload = parse_jsonp_payload(text)
+        for item in payload.get("stockInfo") or []:
+            if str(item.get("code", "")).zfill(5) == symbol_digits:
+                lookup = {
+                    "stock_id": item.get("stockId"),
+                    "code": str(item.get("code", "")).zfill(5),
+                    "name": item.get("name"),
+                }
+                HKEX_STOCK_LOOKUP_CACHE[symbol_digits] = lookup
+                return lookup
+    lookup = {"stock_id": None, "code": symbol_digits, "name": company_name}
+    HKEX_STOCK_LOOKUP_CACHE[symbol_digits] = lookup
+    return lookup
+
+
+def score_news_flow(items):
+    if not items:
+        return None
+    positive_count = len([item for item in items if item.get("signal") == "positive"])
+    negative_count = len([item for item in items if item.get("signal") == "negative"])
+    score = 50.0 + min(positive_count, 3) * 8.0 - min(negative_count, 3) * 10.0
+    if positive_count > negative_count and len(items) >= 3:
+        score += 4.0
+    return clamp(score, 0.0, 100.0)
+
+
+def score_announcement_flow(items):
+    if not items:
+        return None
+    positive_count = len([item for item in items if item.get("signal") == "positive"])
+    negative_count = len([item for item in items if item.get("signal") == "negative"])
+    score = 50.0 + min(positive_count, 2) * 10.0 - min(negative_count, 3) * 12.0
+    return clamp(score, 0.0, 100.0)
+
+
+def score_event_window(next_in_days):
+    if next_in_days is None:
+        return 50.0
+    if next_in_days <= 3:
+        return 20.0
+    if next_in_days <= 7:
+        return 30.0
+    if next_in_days <= 14:
+        return 40.0
+    if next_in_days <= 30:
+        return 48.0
+    if next_in_days <= 60:
+        return 55.0
+    return 60.0
+
+
+def fetch_google_news(symbol, company_name, lookback_days, limit):
+    symbol_digits = normalize_symbol_digits(symbol)
+    aliases = derive_company_aliases(company_name, symbol_digits)
+    query = f"\"{aliases[0]}\" OR \"{int(symbol_digits)} HK\" when:{int(lookback_days)}d"
+    url = (
+        "https://news.google.com/rss/search?q="
+        f"{quote(query)}&hl=en-US&gl=US&ceid=US:en"
+    )
+    try:
+        text = fetch_text(url)
+        root = ET.fromstring(text)
+    except Exception:
+        return {"available": False, "items": [], "score": None}
+    cutoff = utc_now().replace(tzinfo=None) - timedelta(days=int(lookback_days))
+    items = []
+    for node in root.findall("./channel/item"):
+        title = html.unescape(node.findtext("title") or "")
+        description = html.unescape(node.findtext("description") or "")
+        combined = f"{title} {description}".strip()
+        if not text_mentions_company(combined, aliases, symbol_digits):
+            continue
+        published_at = None
+        try:
+            published_at = parsedate_to_datetime(node.findtext("pubDate") or "")
+        except Exception:
+            published_at = None
+        if published_at and published_at.replace(tzinfo=None) < cutoff:
+            continue
+        items.append(
+            {
+                "title": title,
+                "link": node.findtext("link"),
+                "published_at": published_at.isoformat() if published_at else None,
+                "signal": classify_text_signal(combined, NEWS_POSITIVE_KEYWORDS, NEWS_NEGATIVE_KEYWORDS),
+            }
+        )
+    items = items[: int(limit)]
+    return {
+        "available": True,
+        "items": items,
+        "score": score_news_flow(items),
+        "positive_count": len([item for item in items if item.get("signal") == "positive"]),
+        "negative_count": len([item for item in items if item.get("signal") == "negative"]),
+    }
+
+
+def parse_hkex_announcement_row(row, symbol_digits):
+    release_node = row.select_one("td.release-time")
+    code_node = row.select_one("td.stock-short-code")
+    name_node = row.select_one("td.stock-short-name")
+    headline_node = row.select_one("div.headline")
+    link_node = row.select_one("div.doc-link a")
+    if not release_node or not code_node or not headline_node or not link_node:
+        return None
+    codes = [item.strip() for item in code_node.stripped_strings if item.strip() and "Stock Code" not in item]
+    if symbol_digits not in [str(item).zfill(5) for item in codes]:
+        return None
+    release_text = " ".join(item.strip() for item in release_node.stripped_strings if "Release Time" not in item)
+    release_dt = safe_parse_datetime(release_text, ("%d/%m/%Y %H:%M",))
+    category = " ".join(headline_node.stripped_strings)
+    title = " ".join(link_node.stripped_strings)
+    combined = f"{category} {title}"
+    signal = classify_text_signal(combined, ANNOUNCEMENT_POSITIVE_KEYWORDS, ANNOUNCEMENT_NEGATIVE_KEYWORDS)
+    significance = 1
+    if any(item in combined.lower() for item in ANNOUNCEMENT_NOISE_KEYWORDS):
+        significance = 0
+    if signal != "neutral":
+        significance = 2
+    return {
+        "release_time": release_dt.isoformat() if release_dt else None,
+        "codes": [str(item).zfill(5) for item in codes],
+        "names": [item.strip() for item in name_node.stripped_strings if item.strip() and "Stock Short Name" not in item],
+        "category": category,
+        "title": title,
+        "link": urljoin("https://www1.hkexnews.hk", link_node.get("href", "")),
+        "signal": signal,
+        "significance": significance,
+    }
+
+
+def fetch_hkex_announcements(symbol, company_name, lookback_days, limit):
+    lookup = fetch_hkex_stock_lookup(symbol, company_name)
+    stock_id = lookup.get("stock_id")
+    if not stock_id:
+        return {"available": False, "items": [], "score": None, "lookup": lookup}
+    try:
+        text = fetch_text(
+            "https://www1.hkexnews.hk/search/titlesearch.xhtml",
+            params={"lang": "EN", "category": "0", "market": "SEHK", "stockId": stock_id},
+        )
+    except Exception:
+        return {"available": False, "items": [], "score": None, "lookup": lookup}
+    symbol_digits = normalize_symbol_digits(symbol)
+    cutoff = utc_now().replace(tzinfo=None) - timedelta(days=int(lookback_days))
+    soup = BeautifulSoup(text, "html.parser")
+    records = []
+    for row in soup.select("main tr"):
+        item = parse_hkex_announcement_row(row, symbol_digits)
+        if not item:
+            continue
+        release_dt = parse_date(item.get("release_time")) or safe_parse_datetime(item.get("release_time"), ("%Y-%m-%dT%H:%M:%S",))
+        if release_dt and isinstance(release_dt, datetime) and release_dt < cutoff:
+            continue
+        records.append(item)
+    records.sort(key=lambda item: item.get("release_time") or "", reverse=True)
+    filtered = [item for item in records if item.get("significance", 0) > 0] or records
+    filtered = filtered[: int(limit)]
+    return {
+        "available": True,
+        "lookup": lookup,
+        "items": filtered,
+        "score": score_announcement_flow(filtered),
+        "positive_count": len([item for item in filtered if item.get("signal") == "positive"]),
+        "negative_count": len([item for item in filtered if item.get("signal") == "negative"]),
+    }
+
+
+def get_hkex_board_meeting_records(board="main"):
+    board_key = "main" if board != "gem" else "gem"
+    today_key = utc_now().strftime("%Y-%m-%d")
+    cache_key = f"{board_key}:{today_key}"
+    if cache_key in HKEX_BOARD_MEETING_CACHE:
+        return HKEX_BOARD_MEETING_CACHE[cache_key]
+    url = "https://www3.hkexnews.hk/reports/bmn/ebmn.htm"
+    if board_key == "gem":
+        url = "https://www3.hkexnews.hk/reports/bmn/ebmngem.htm"
+    text = fetch_text(url)
+    soup = BeautifulSoup(text, "html.parser")
+    records = []
+    for row in soup.select("table.textfont tr")[2:]:
+        parts = [item.strip() for item in row.stripped_strings if item.strip()]
+        if len(parts) < 5:
+            continue
+        bm_dt = safe_parse_datetime(parts[0], ("%d/%m/%Y",))
+        if not bm_dt:
+            continue
+        records.append(
+            {
+                "bm_date": bm_dt.strftime("%Y-%m-%d"),
+                "stock_short_name": parts[1],
+                "code": str(parts[2]).zfill(5),
+                "purpose": parts[3],
+                "period": parts[4],
+                "board": board_key.upper(),
+            }
+        )
+    HKEX_BOARD_MEETING_CACHE[cache_key] = records
+    return records
+
+
+def fetch_hkex_earnings_calendar(symbol, lookahead_days, limit):
+    symbol_digits = normalize_symbol_digits(symbol)
+    now = utc_now().date()
+    cutoff = now + timedelta(days=int(lookahead_days))
+    matched = []
+    try:
+        for board in ("main", "gem"):
+            for item in get_hkex_board_meeting_records(board):
+                if item.get("code") != symbol_digits:
+                    continue
+                bm_date = safe_parse_datetime(item.get("bm_date"), ("%Y-%m-%d",))
+                if not bm_date:
+                    continue
+                if bm_date.date() < now or bm_date.date() > cutoff:
+                    continue
+                matched.append(
+                    {
+                        **item,
+                        "days_until": (bm_date.date() - now).days,
+                    }
+                )
+    except Exception:
+        return {"available": False, "items": [], "next_in_days": None, "score": None}
+    matched.sort(key=lambda item: item.get("bm_date"))
+    next_in_days = matched[0]["days_until"] if matched else None
+    return {
+        "available": True,
+        "items": matched[: int(limit)],
+        "next_in_days": next_in_days,
+        "score": score_event_window(next_in_days),
+    }
+
+
+def build_information_snapshot(symbol, company_name, args):
+    news = fetch_google_news(
+        symbol,
+        company_name,
+        getattr(args, "news_lookback_days", 14),
+        getattr(args, "news_limit", 5),
+    )
+    announcements = fetch_hkex_announcements(
+        symbol,
+        company_name,
+        getattr(args, "announcement_lookback_days", 30),
+        getattr(args, "announcement_limit", 6),
+    )
+    earnings_calendar = fetch_hkex_earnings_calendar(
+        symbol,
+        getattr(args, "earnings_lookahead_days", 120),
+        3,
+    )
+    sub_scores = [item for item in (news.get("score"), announcements.get("score"), earnings_calendar.get("score")) if item is not None]
+    overall_score = round(
+        (news.get("score", 50.0) or 50.0) * 0.4
+        + (announcements.get("score", 50.0) or 50.0) * 0.35
+        + (earnings_calendar.get("score", 50.0) or 50.0) * 0.25,
+        2,
+    ) if sub_scores else None
+    risk_flags = []
+    next_in_days = earnings_calendar.get("next_in_days")
+    if next_in_days is not None and next_in_days <= 7:
+        risk_flags.append("earnings_window_7d")
+    if (announcements.get("negative_count") or 0) > 0:
+        risk_flags.append("negative_announcements")
+    if (news.get("negative_count") or 0) > (news.get("positive_count") or 0):
+        risk_flags.append("negative_news_flow")
+    return {
+        "available": bool(sub_scores),
+        "score": overall_score,
+        "risk_flags": risk_flags,
+        "news": news,
+        "announcements": announcements,
+        "earnings_calendar": earnings_calendar,
+    }
+
+
 def compute_returns(prices, days):
     if prices is None or len(prices) <= days:
         return None
@@ -637,6 +1223,343 @@ def parse_schedule_days(value):
     return tokens or ["mon", "tue", "wed", "thu", "fri"]
 
 
+def resolve_schedule_preferences_path():
+    target = get_report_root() / "config" / "report_schedule_preferences.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def build_default_schedule_preferences():
+    return {
+        "version": "v1",
+        "profile": "default",
+        "scheduler_mode": "openclaw_primary",
+        "enabled_reports": [
+            "pre_open",
+            "pre_trade",
+            "midday",
+            "pre_close_risk",
+            "post_close",
+            "night_review",
+        ],
+        "report_times": {},
+        "retry_maintenance": {
+            "enabled": True,
+            "start": "08:35",
+            "end": "21:05",
+            "interval_minutes": 5,
+            "limit": 10,
+        },
+    }
+
+
+def load_schedule_preferences():
+    payload = load_json_file(resolve_schedule_preferences_path(), build_default_schedule_preferences())
+    defaults = build_default_schedule_preferences()
+    merged = dict(defaults)
+    merged.update(payload or {})
+    merged["scheduler_mode"] = payload.get("scheduler_mode") if isinstance(payload, dict) and payload.get("scheduler_mode") else defaults["scheduler_mode"]
+    merged["enabled_reports"] = payload.get("enabled_reports") if isinstance(payload, dict) and payload.get("enabled_reports") else defaults["enabled_reports"]
+    merged["report_times"] = payload.get("report_times") if isinstance(payload, dict) and isinstance(payload.get("report_times"), dict) else {}
+    retry_payload = payload.get("retry_maintenance") if isinstance(payload, dict) and isinstance(payload.get("retry_maintenance"), dict) else {}
+    retry_defaults = defaults["retry_maintenance"]
+    merged["retry_maintenance"] = {
+        "enabled": bool(retry_payload.get("enabled", retry_defaults["enabled"])),
+        "start": retry_payload.get("start") or retry_defaults["start"],
+        "end": retry_payload.get("end") or retry_defaults["end"],
+        "interval_minutes": int(retry_payload.get("interval_minutes") or retry_defaults["interval_minutes"]),
+        "limit": int(retry_payload.get("limit") or retry_defaults["limit"]),
+    }
+    return merged
+
+
+def save_schedule_preferences(preferences):
+    payload = build_default_schedule_preferences()
+    payload.update(preferences or {})
+    save_json_file(resolve_schedule_preferences_path(), payload)
+    return payload
+
+
+def build_schedule_profile(profile_name):
+    defaults = build_default_schedule_preferences()
+    profile = (profile_name or "default").lower()
+    if profile == "compact":
+        defaults["enabled_reports"] = ["pre_open", "midday", "post_close", "night_review"]
+    elif profile == "minimal":
+        defaults["enabled_reports"] = ["post_close", "night_review"]
+    defaults["profile"] = profile
+    return defaults
+
+
+def parse_report_time_map(value):
+    raw = parse_json_map(value)
+    if not raw:
+        return {}
+    parsed = {}
+    for key, item in raw.items():
+        text, _minutes = parse_hhmm(item, item)
+        parsed[str(key)] = text
+    return parsed
+
+
+def build_fixed_report_catalog():
+    return [
+        {
+            "time": "08:30",
+            "report_type": "pre_open",
+            "title": "盘前总览",
+            "command": "python3 {baseDir}/screener_skill.py run-scheduled --job pre_open",
+        },
+        {
+            "time": "09:15",
+            "report_type": "pre_trade",
+            "title": "开盘前策略结论",
+            "command": "python3 {baseDir}/screener_skill.py run-scheduled --job pre_trade",
+        },
+        {
+            "time": "11:50",
+            "report_type": "midday",
+            "title": "午间进度报告",
+            "command": "python3 {baseDir}/screener_skill.py run-scheduled --job midday",
+        },
+        {
+            "time": "15:30",
+            "report_type": "pre_close_risk",
+            "title": "收盘前风险检查",
+            "command": "python3 {baseDir}/screener_skill.py run-scheduled --job pre_close_risk",
+        },
+        {
+            "time": "16:30",
+            "report_type": "post_close",
+            "title": "收盘后执行总结",
+            "command": "python3 {baseDir}/screener_skill.py run-scheduled --job post_close",
+        },
+        {
+            "time": "20:30",
+            "report_type": "night_review",
+            "title": "夜间复盘",
+            "command": "python3 {baseDir}/screener_skill.py run-scheduled --job night_review",
+        },
+    ]
+
+
+def build_report_alias_map():
+    return {
+        "pre_open": ["pre_open", "盘前总览", "盘前", "盘前报告", "盘前汇报"],
+        "pre_trade": ["pre_trade", "开盘前策略结论", "开盘前", "开盘前报告", "开盘前汇报", "策略结论"],
+        "midday": ["midday", "午间进度报告", "午间", "午间报告", "午盘", "中午报告"],
+        "pre_close_risk": ["pre_close_risk", "收盘前风险检查", "收盘前", "收盘前风险", "尾盘风险", "风险检查"],
+        "post_close": ["post_close", "收盘后执行总结", "收盘后", "收盘总结", "收盘报告", "执行总结"],
+        "night_review": ["night_review", "夜间复盘", "夜间", "晚间复盘", "复盘", "夜盘复盘"],
+    }
+
+
+def alias_to_pattern(alias):
+    if alias == "盘前":
+        return r"(?<!收)盘前"
+    return re.escape(alias)
+
+
+def detect_report_types_in_text(text):
+    matched = []
+    source = text or ""
+    lowered = source.lower()
+    for report_type, aliases in build_report_alias_map().items():
+        for alias in aliases:
+            alias_lower = alias.lower()
+            pattern = alias_to_pattern(alias) if any(ord(ch) > 127 for ch in alias) else re.escape(alias_lower)
+            if alias_lower and re.search(pattern, source if any(ord(ch) > 127 for ch in alias) else lowered, re.IGNORECASE):
+                matched.append(report_type)
+                break
+    return matched
+
+
+def infer_schedule_profile_from_message(text):
+    lowered = (text or "").lower()
+    if any(token in lowered for token in ["恢复默认", "重置默认", "默认设置", "默认汇报", "reset default"]):
+        return "default"
+    if any(token in lowered for token in ["精简版", "简版", "compact"]):
+        return "compact"
+    if any(token in lowered for token in ["最小版", "极简版", "minimal"]):
+        return "minimal"
+    return None
+
+
+def infer_scheduler_mode_from_message(text):
+    lowered = (text or "").lower()
+    if "cron" in lowered and any(token in lowered for token in ["主", "优先", "primary"]):
+        return "cron_primary"
+    if any(token in lowered for token in ["openclaw", "automation"]) and any(token in lowered for token in ["主", "优先", "primary"]):
+        return "openclaw_primary"
+    return None
+
+
+def infer_time_updates_from_message(text):
+    updates = {}
+    if not text:
+        return updates
+    for report_type, aliases in build_report_alias_map().items():
+        alias_pattern = "|".join(alias_to_pattern(alias) for alias in aliases)
+        pattern = re.compile(rf"(?:{alias_pattern})(?:报告|汇报)?(?:时间)?(?:改到|调整到|改成|调整为|推迟到|提前到|改为)\s*(\d{{1,2}}:\d{{2}})", re.IGNORECASE)
+        match = pattern.search(text)
+        if match:
+            updates[report_type] = parse_hhmm(match.group(1), match.group(1))[0]
+    return updates
+
+
+def build_schedule_preference_snapshot(preferences):
+    schedule_spec = build_schedule_spec(preferences_override=preferences)
+    default_catalog = {item["report_type"]: item for item in build_fixed_report_catalog()}
+    active_reports = []
+    scheduler_mode = (preferences.get("scheduler_mode") or "openclaw_primary").lower()
+    for item in schedule_spec.get("fixed_reports") or []:
+        active_reports.append(
+            {
+                "report_type": item["report_type"],
+                "title": item["title"],
+                "time": item["time"],
+                "user_customized": bool(item.get("user_customized")),
+                "delivery_surface": "OpenClaw automation 卡片" if scheduler_mode == "openclaw_primary" else "系统 cron 任务",
+            }
+        )
+    active_report_types = {item["report_type"] for item in schedule_spec.get("fixed_reports") or []}
+    disabled_reports = []
+    for report_type, item in default_catalog.items():
+        if report_type in active_report_types:
+            continue
+        disabled_reports.append(
+            {
+                "report_type": report_type,
+                "title": item["title"],
+                "default_time": item["time"],
+            }
+        )
+    maintenance_jobs = []
+    for item in schedule_spec.get("maintenance_jobs") or []:
+        maintenance_jobs.append(
+            {
+                "job_id": item["task"],
+                "title": item["title"],
+                "window": item["window"],
+                "interval_minutes": item["interval_minutes"],
+                "delivery_surface": "系统 cron fallback",
+            }
+        )
+    automation_plan, unsupported = build_openclaw_automation_payload(schedule_spec)
+    return schedule_spec, {
+        "preferences_path": str(resolve_schedule_preferences_path()),
+        "schedule_path": str(resolve_schedule_path()),
+        "profile": preferences.get("profile") or "default",
+        "scheduler_mode": scheduler_mode,
+        "user_touchpoints": {
+            "primary": "用户先在对话里提出汇报时间或频率要求，再由主 agent 更新偏好并生成 OpenClaw automation 更新建议",
+            "steps": [
+                "用户直接对主 agent 说“调整汇报时间”或“关闭某个时段报告”",
+                "主 agent 更新 report_schedule_preferences.json",
+                "主 agent 生成或更新 OpenClaw automation 卡片，供用户确认",
+                "固定报告按 OpenClaw automation 生效；高频 delivery_retry 继续走 cron fallback",
+            ],
+            "has_dedicated_settings_page": False,
+        },
+        "active_reports": active_reports,
+        "disabled_reports": disabled_reports,
+        "maintenance_jobs": maintenance_jobs,
+        "automation_plan": automation_plan,
+        "unsupported_jobs": unsupported,
+    }
+
+
+def persist_schedule_spec(spec=None):
+    path = resolve_schedule_path()
+    payload = spec or build_schedule_spec()
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    return payload, path
+
+
+def apply_natural_language_schedule_request(message, dry_run=False):
+    if not message or not str(message).strip():
+        json_out({"ok": False, "error": "缺少 --message，无法解析用户的汇报设置要求"}, 1)
+    message = str(message).strip()
+    preferences = load_schedule_preferences()
+    original_preferences = copy.deepcopy(preferences)
+    changes = []
+    notes = []
+    profile = infer_schedule_profile_from_message(message)
+    if profile:
+        preferences = build_schedule_profile(profile)
+        preferences["scheduler_mode"] = original_preferences.get("scheduler_mode", preferences.get("scheduler_mode"))
+        changes.append({"type": "profile", "value": profile})
+    scheduler_mode = infer_scheduler_mode_from_message(message)
+    if scheduler_mode:
+        preferences["scheduler_mode"] = scheduler_mode
+        changes.append({"type": "scheduler_mode", "value": scheduler_mode})
+    lowered = message.lower()
+    if "event_alert" in lowered or "事件快报" in message:
+        notes.append("event_alert 为事件驱动快报，不属于固定时点报告，本次仅调整固定报告与 retry 维护任务。")
+    if any(token in lowered for token in ["恢复默认", "重置默认", "默认设置", "reset default"]):
+        preferences = build_default_schedule_preferences()
+        changes.append({"type": "reset", "value": "default"})
+    selected_reports = detect_report_types_in_text(message)
+    if any(token in message for token in ["只保留", "只要"]) and selected_reports:
+        preferences["enabled_reports"] = sorted(set(selected_reports))
+        changes.append({"type": "set_enabled_reports", "value": preferences["enabled_reports"]})
+    else:
+        enabled_reports = set(preferences.get("enabled_reports") or [])
+        if any(token in message for token in ["关闭", "不要", "取消", "停掉", "去掉"]) and selected_reports:
+            enabled_reports = {item for item in enabled_reports if item not in set(selected_reports)}
+            changes.append({"type": "disable_reports", "value": sorted(set(selected_reports))})
+        if any(token in message for token in ["开启", "打开", "恢复"]) and selected_reports:
+            enabled_reports.update(selected_reports)
+            changes.append({"type": "enable_reports", "value": sorted(set(selected_reports))})
+        if enabled_reports:
+            preferences["enabled_reports"] = sorted(enabled_reports)
+    time_updates = infer_time_updates_from_message(message)
+    if time_updates:
+        report_times = dict(preferences.get("report_times") or {})
+        report_times.update(time_updates)
+        preferences["report_times"] = report_times
+        changes.append({"type": "time_updates", "value": time_updates})
+    if any(token in message for token in ["关闭补发", "关闭重试", "停掉补发", "停掉重试"]):
+        retry_preferences = dict(preferences.get("retry_maintenance") or {})
+        retry_preferences["enabled"] = False
+        preferences["retry_maintenance"] = retry_preferences
+        changes.append({"type": "retry_maintenance", "value": "disabled"})
+    if any(token in message for token in ["开启补发", "开启重试", "打开补发", "打开重试"]):
+        retry_preferences = dict(preferences.get("retry_maintenance") or {})
+        retry_preferences["enabled"] = True
+        preferences["retry_maintenance"] = retry_preferences
+        changes.append({"type": "retry_maintenance", "value": "enabled"})
+    if not changes:
+        json_out(
+            {
+                "ok": False,
+                "error": "未识别到可执行的汇报设置变更，请明确说出要关闭哪些报告、保留哪些报告或把哪个时段改到几点。",
+                "examples": [
+                    "关闭午间报告和收盘前风险检查",
+                    "只保留盘前和收盘后两份",
+                    "把夜间复盘改到21:30",
+                    "改成精简版",
+                ],
+            },
+            1,
+        )
+    if not dry_run:
+        preferences = save_schedule_preferences(preferences)
+        schedule_spec, schedule_path = persist_schedule_spec(build_schedule_spec(preferences_override=preferences))
+    else:
+        schedule_spec = build_schedule_spec(preferences_override=preferences)
+        schedule_path = resolve_schedule_path()
+    _schedule_spec, summary = build_schedule_preference_snapshot(preferences)
+    summary["request_message"] = message
+    summary["changes"] = changes
+    summary["notes"] = notes
+    summary["dry_run"] = bool(dry_run)
+    summary["schedule_path"] = str(schedule_path)
+    summary["preferences_before"] = original_preferences
+    summary["preferences_after"] = preferences
+    return summary
+
+
 def build_schedule_times(start_minutes, end_minutes, interval_minutes):
     if end_minutes < start_minutes:
         json_out({"ok": False, "error": "结束时间不能早于开始时间"}, 1)
@@ -650,20 +1573,98 @@ def build_schedule_times(start_minutes, end_minutes, interval_minutes):
     return times
 
 
-def build_schedule_spec(args=None):
+def build_schedule_spec(args=None, preferences_override=None):
+    preferences = preferences_override or load_schedule_preferences()
     start_value = getattr(args, "schedule_start", None) if args else None
     end_value = getattr(args, "schedule_end", None) if args else None
     interval_value = getattr(args, "schedule_interval", None) if args else None
+    retry_prefs = preferences.get("retry_maintenance") or {}
+    retry_start_value = getattr(args, "retry_schedule_start", None) if args else None
+    retry_end_value = getattr(args, "retry_schedule_end", None) if args else None
+    retry_interval_value = getattr(args, "retry_schedule_interval", None) if args else None
+    retry_limit = int(getattr(args, "retry_limit", retry_prefs.get("limit", 10)) if args else retry_prefs.get("limit", 10))
     timezone = getattr(args, "schedule_timezone", None) if args else None
     days = parse_schedule_days(getattr(args, "schedule_days", None) if args else None)
     start_text, start_minutes = parse_hhmm(start_value, "08:30")
     end_text, end_minutes = parse_hhmm(end_value, "17:30")
     interval = parse_interval_minutes(interval_value, 30)
+    retry_start_text, retry_start_minutes = parse_hhmm(retry_start_value, retry_prefs.get("start", "08:35"))
+    retry_end_text, retry_end_minutes = parse_hhmm(retry_end_value, retry_prefs.get("end", "21:05"))
+    retry_interval = parse_interval_minutes(retry_interval_value, retry_prefs.get("interval_minutes", 5))
     timezone = timezone or "Asia/Hong_Kong"
     times = build_schedule_times(start_minutes, end_minutes, interval)
+    retry_times = build_schedule_times(retry_start_minutes, retry_end_minutes, retry_interval)
     command = getattr(args, "schedule_command", None) if args else None
     if not command:
         command = "python3 {baseDir}/screener_skill.py auto"
+    fixed_reports = build_fixed_report_catalog()
+    enabled_reports = set(preferences.get("enabled_reports") or [])
+    report_time_overrides = preferences.get("report_times") or {}
+    filtered_reports = []
+    for item in fixed_reports:
+        report_type = item["report_type"]
+        if enabled_reports and report_type not in enabled_reports:
+            continue
+        overridden_time = report_time_overrides.get(report_type)
+        if overridden_time:
+            item = {**item, "time": overridden_time}
+        item = {
+            **item,
+            "user_customized": bool(overridden_time or report_type not in build_default_schedule_preferences()["enabled_reports"]),
+        }
+        filtered_reports.append(item)
+    fixed_reports = filtered_reports
+    event_alerts = [
+        "新开仓、清仓、止损、止盈",
+        "单票仓位显著变化",
+        "重大公告、重大新闻、监管风险",
+        "财报窗口进入近7天",
+        "组合回撤超阈值",
+        "执行失败、数据异常、系统故障",
+    ]
+    maintenance_jobs = []
+    retry_enabled = retry_prefs.get("enabled", True)
+    if getattr(args, "disable_retry_maintenance", False) if args else False:
+        retry_enabled = False
+    if retry_enabled:
+        maintenance_jobs.append(
+            {
+                "task": "delivery_retry",
+                "title": "报告补发重试",
+                "days": days,
+                "window": {"start": retry_start_text, "end": retry_end_text},
+                "interval_minutes": retry_interval,
+                "times": retry_times,
+                "command": "python3 {baseDir}/screener_skill.py run-scheduled --job delivery_retry",
+                "limit": retry_limit,
+                "purpose": "独立处理发送失败且已到期的历史报告，不依赖主筛选流程触发",
+            }
+        )
+    jobs = []
+    for item in fixed_reports:
+        jobs.append(
+            {
+                "job_id": item["report_type"],
+                "job_type": "fixed_report",
+                "title": item["title"],
+                "command": item["command"],
+                "time": item["time"],
+                "days": days,
+            }
+        )
+    for item in maintenance_jobs:
+        jobs.append(
+            {
+                "job_id": item["task"],
+                "job_type": "maintenance",
+                "title": item["title"],
+                "command": item["command"],
+                "days": item["days"],
+                "window": item["window"],
+                "interval_minutes": item["interval_minutes"],
+                "times": item["times"],
+            }
+        )
     return {
         "timezone": timezone,
         "window": {"start": start_text, "end": end_text},
@@ -671,6 +1672,11 @@ def build_schedule_spec(args=None):
         "days": days,
         "times": times,
         "command": command,
+        "preferences": preferences,
+        "jobs": jobs,
+        "fixed_reports": fixed_reports,
+        "maintenance_jobs": maintenance_jobs,
+        "event_alert_triggers": event_alerts,
         "trade_day_mode": "weekday",
         "calendar_file": getattr(args, "calendar_file", None) if args else None,
     }
@@ -682,11 +1688,474 @@ def resolve_schedule_path():
     return target
 
 
+def resolve_scheduled_run_log_path():
+    target = get_report_root() / "index" / "scheduled_run_log.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def load_scheduled_run_log():
+    return load_json_file(
+        resolve_scheduled_run_log_path(),
+        {
+            "version": "v1",
+            "updated_at": iso_utc_now(),
+            "entries": [],
+        },
+    )
+
+
+def append_scheduled_run_log(entry, max_entries=500):
+    log_payload = load_scheduled_run_log()
+    entries = log_payload.setdefault("entries", [])
+    entries.insert(0, entry)
+    log_payload["entries"] = entries[:max_entries]
+    log_payload["updated_at"] = iso_utc_now()
+    save_json_file(resolve_scheduled_run_log_path(), log_payload)
+    return entry
+
+
+def query_scheduled_run_log(job=None, status=None, limit=20):
+    log_payload = load_scheduled_run_log()
+    entries = []
+    for entry in log_payload.get("entries") or []:
+        if job and entry.get("job_id") != job:
+            continue
+        if status and entry.get("status") != status:
+            continue
+        entries.append(entry)
+        if limit and len(entries) >= limit:
+            break
+    return {
+        "path": str(resolve_scheduled_run_log_path()),
+        "total": len(entries),
+        "entries": entries,
+    }
+
+
+def resolve_cron_export_path():
+    target = get_report_root() / "cron" / "clawtrade_schedule.cron"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def build_cron_day_field(days):
+    day_map = {
+        "sun": "0",
+        "mon": "1",
+        "tue": "2",
+        "wed": "3",
+        "thu": "4",
+        "fri": "5",
+        "sat": "6",
+    }
+    mapped = [day_map[item] for item in days if item in day_map]
+    return ",".join(mapped) if mapped else "1,2,3,4,5"
+
+
+def build_cron_lines(spec, python_path=None, base_dir=None):
+    python_cmd = python_path or sys.executable
+    base_dir = Path(base_dir or Path(__file__).resolve().parent).resolve()
+    script_path = base_dir / "screener_skill.py"
+    logs_dir = get_report_root() / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    scheduler_mode = ((spec.get("preferences") or {}).get("scheduler_mode") or "openclaw_primary").lower()
+    lines = [
+        f"# Generated by screener_skill.py on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"SCREENER_RUN_CONTEXT=scheduled",
+        f"# scheduler_mode={scheduler_mode}",
+    ]
+    for job in spec.get("jobs") or []:
+        if scheduler_mode == "openclaw_primary" and job.get("job_type") != "maintenance":
+            continue
+        day_field = build_cron_day_field(job.get("days") or spec.get("days") or [])
+        job_times = [job.get("time")] if job.get("time") else list(job.get("times") or [])
+        for hhmm in job_times:
+            if not hhmm:
+                continue
+            hour, minute = hhmm.split(":", 1)
+            log_path = logs_dir / f"{job['job_id']}.log"
+            lines.append(
+                f"{int(minute)} {int(hour)} * * {day_field} cd {base_dir} && "
+                f"{python_cmd} {script_path} run-scheduled --job {job['job_id']} >> {log_path} 2>&1"
+            )
+    return lines
+
+
+def export_cron(args):
+    spec, _path = load_schedule_spec()
+    output_path = Path(getattr(args, "output", None) or resolve_cron_export_path()).expanduser().resolve()
+    lines = build_cron_lines(spec, python_path=getattr(args, "python_path", None), base_dir=getattr(args, "base_dir", None))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    json_out(
+        {
+            "ok": True,
+            "data": {
+                "path": str(output_path),
+                "jobs_total": len(spec.get("jobs") or []),
+                "line_count": len(lines),
+                "preview": lines[: min(10, len(lines))],
+            },
+        }
+    )
+
+
+def install_cron(args):
+    output_path = Path(getattr(args, "output", None) or resolve_cron_export_path()).expanduser().resolve()
+    spec, _path = load_schedule_spec()
+    lines = build_cron_lines(spec, python_path=getattr(args, "python_path", None), base_dir=getattr(args, "base_dir", None))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    begin_marker = "# BEGIN CLAWTRADE-SCHEDULE"
+    end_marker = "# END CLAWTRADE-SCHEDULE"
+    try:
+        existing = subprocess.run(["crontab", "-l"], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        json_out({"ok": False, "error": "未找到 crontab 命令"}, 1)
+    current_text = existing.stdout if existing.returncode == 0 else ""
+    preserved = []
+    inside_block = False
+    for raw_line in current_text.splitlines():
+        line = raw_line.rstrip("\n")
+        if line.strip() == begin_marker:
+            inside_block = True
+            continue
+        if line.strip() == end_marker:
+            inside_block = False
+            continue
+        if not inside_block:
+            preserved.append(line)
+    managed_block = [begin_marker, *lines, end_marker]
+    merged_lines = [line for line in preserved if line.strip()]
+    if merged_lines:
+        merged_lines.append("")
+    merged_lines.extend(managed_block)
+    payload = "\n".join(merged_lines) + "\n"
+    install = subprocess.run(["crontab", "-"], input=payload, text=True, capture_output=True, check=False)
+    if install.returncode != 0:
+        json_out(
+            {
+                "ok": False,
+                "error": install.stderr.strip() or install.stdout.strip() or "crontab 安装失败",
+                "path": str(output_path),
+            },
+            1,
+        )
+    json_out(
+        {
+            "ok": True,
+            "data": {
+                "installed": True,
+                "path": str(output_path),
+                "jobs_total": len(spec.get("jobs") or []),
+                "managed_markers": {"begin": begin_marker, "end": end_marker},
+            },
+        }
+    )
+
+
 def output_schedule(args):
     spec = build_schedule_spec(args)
     path = resolve_schedule_path()
     path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
     json_out({"ok": True, "data": {"schedule": spec, "path": str(path)}})
+
+
+def manage_schedule_preferences(args):
+    if getattr(args, "reset", False):
+        preferences = save_schedule_preferences(build_default_schedule_preferences())
+    else:
+        preferences = load_schedule_preferences()
+        if getattr(args, "profile", None):
+            preferences = build_schedule_profile(args.profile)
+        if getattr(args, "scheduler_mode", None):
+            preferences["scheduler_mode"] = args.scheduler_mode
+        enabled_reports = set(preferences.get("enabled_reports") or [])
+        if getattr(args, "enable_report_types", None):
+            enabled_reports.update(args.enable_report_types)
+        if getattr(args, "disable_report_types", None):
+            enabled_reports = {item for item in enabled_reports if item not in set(args.disable_report_types)}
+        if enabled_reports:
+            preferences["enabled_reports"] = sorted(enabled_reports)
+        report_times = dict(preferences.get("report_times") or {})
+        report_times.update(parse_report_time_map(getattr(args, "report_times", None)))
+        preferences["report_times"] = report_times
+        retry_preferences = dict(preferences.get("retry_maintenance") or {})
+        if getattr(args, "enable_retry_maintenance", False):
+            retry_preferences["enabled"] = True
+        if getattr(args, "disable_retry_maintenance", False):
+            retry_preferences["enabled"] = False
+        if getattr(args, "retry_schedule_start", None):
+            retry_preferences["start"] = parse_hhmm(args.retry_schedule_start, args.retry_schedule_start)[0]
+        if getattr(args, "retry_schedule_end", None):
+            retry_preferences["end"] = parse_hhmm(args.retry_schedule_end, args.retry_schedule_end)[0]
+        if getattr(args, "retry_schedule_interval", None):
+            retry_preferences["interval_minutes"] = parse_interval_minutes(args.retry_schedule_interval, args.retry_schedule_interval)
+        if getattr(args, "retry_limit", None):
+            retry_preferences["limit"] = int(args.retry_limit)
+        preferences["retry_maintenance"] = retry_preferences
+        preferences = save_schedule_preferences(preferences)
+    schedule_spec, schedule_path = persist_schedule_spec()
+    json_out(
+        {
+            "ok": True,
+            "data": {
+                "path": str(resolve_schedule_preferences_path()),
+                "preferences": preferences,
+                "schedule_preview": schedule_spec,
+                "schedule_path": str(schedule_path),
+            },
+        }
+    )
+
+
+def build_automation_rrule(days, hhmm):
+    day_map = {
+        "mon": "MO",
+        "tue": "TU",
+        "wed": "WE",
+        "thu": "TH",
+        "fri": "FR",
+        "sat": "SA",
+        "sun": "SU",
+    }
+    hour, minute = hhmm.split(":", 1)
+    byday = ",".join(day_map[item] for item in days if item in day_map)
+    return f"FREQ=WEEKLY;BYDAY={byday};BYHOUR={int(hour)};BYMINUTE={int(minute)}"
+
+
+def build_openclaw_automation_payload(spec):
+    workspace = str(Path(__file__).resolve().parent)
+    automations = []
+    unsupported = []
+    for job in spec.get("jobs") or []:
+        if job.get("job_type") != "fixed_report":
+            unsupported.append(
+                {
+                    "job_id": job.get("job_id"),
+                    "reason": "unsupported_high_frequency_or_maintenance_job",
+                }
+            )
+            continue
+        job_id = job["job_id"]
+        automations.append(
+            {
+                "job_id": job_id,
+                "name": f"ClawTrade {job_id}",
+                "rrule": build_automation_rrule(job.get("days") or spec.get("days") or [], job["time"]),
+                "cwds": [workspace],
+                "status": "ACTIVE",
+                "prompt": (
+                    f"Run `python3 screener_skill.py run-scheduled --job {job_id}`. "
+                    "Return the JSON result. If the run is skipped because another execution is active, say so clearly. "
+                    "If a report is generated, include report_id, report_type, delivery_status, and any failure or retry signals."
+                ),
+            }
+        )
+    return automations, unsupported
+
+
+def output_openclaw_automation_spec(_args):
+    spec, path = load_schedule_spec()
+    automations, unsupported = build_openclaw_automation_payload(spec)
+    json_out(
+        {
+            "ok": True,
+            "data": {
+                "path": str(path),
+                "preferences_path": str(resolve_schedule_preferences_path()),
+                "automations": automations,
+                "unsupported_jobs": unsupported,
+            },
+        }
+    )
+
+
+def build_report_settings_markdown(summary):
+    lines = [
+        "# 汇报设置摘要",
+        "",
+        f"- 调度模式：`{summary['scheduler_mode']}`",
+        f"- 当前配置档位：`{summary['profile']}`",
+        f"- 用户入口：{summary['user_touchpoints']['primary']}",
+    ]
+    if summary.get("request_message"):
+        lines.extend(
+            [
+                f"- 用户请求：{summary['request_message']}",
+                f"- 应用模式：`{'dry_run' if summary.get('dry_run') else 'applied'}`",
+            ]
+        )
+    changes = summary.get("changes") or []
+    if changes:
+        lines.extend(["", "## 本次变更"])
+        for item in changes:
+            lines.append(f"- `{item['type']}` | {json.dumps(item.get('value'), ensure_ascii=False)}")
+    lines.extend(["", "## 当前启用的固定报告"])
+    for item in summary.get("active_reports") or []:
+        lines.append(
+            f"- `{item['report_type']}` | {item['title']} | {item['time']} | 触达形式：{item['delivery_surface']}"
+        )
+    disabled = summary.get("disabled_reports") or []
+    if disabled:
+        lines.extend(["", "## 当前关闭的固定报告"])
+        for item in disabled:
+            lines.append(
+                f"- `{item['report_type']}` | {item['title']} | 默认时间：{item['default_time']}"
+            )
+    maintenance = summary.get("maintenance_jobs") or []
+    if maintenance:
+        lines.extend(["", "## 维护任务"])
+        for item in maintenance:
+            lines.append(
+                f"- `{item['job_id']}` | {item['title']} | {item['window']['start']}-{item['window']['end']} 每 {item['interval_minutes']} 分钟 | 触达形式：{item['delivery_surface']}"
+            )
+    notes = summary.get("notes") or []
+    if notes:
+        lines.extend(["", "## 说明"])
+        for item in notes:
+            lines.append(f"- {item}")
+    lines.extend(["", "## 用户怎么接触这个能力"])
+    for item in summary.get("user_touchpoints", {}).get("steps") or []:
+        lines.append(f"- {item}")
+    return "\n".join(lines)
+
+
+def output_report_settings(args):
+    preferences = load_schedule_preferences()
+    _spec, summary = build_schedule_preference_snapshot(preferences)
+    markdown = build_report_settings_markdown(summary)
+    if getattr(args, "format", "json") == "markdown":
+        print(markdown)
+        return
+    json_out({"ok": True, "data": {**summary, "markdown": markdown}})
+
+
+def output_report_settings_request(args):
+    summary = apply_natural_language_schedule_request(
+        getattr(args, "message", None),
+        dry_run=getattr(args, "dry_run", False),
+    )
+    markdown = build_report_settings_markdown(summary)
+    if getattr(args, "format", "json") == "markdown":
+        print(markdown)
+        return
+    json_out({"ok": True, "data": {**summary, "markdown": markdown}})
+
+
+def load_schedule_spec():
+    path = resolve_schedule_path()
+    spec = build_schedule_spec()
+    path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+    return spec, path
+
+
+def build_scheduled_job_index(spec):
+    jobs = {}
+    for item in spec.get("fixed_reports") or []:
+        jobs[item.get("report_type")] = {"job_type": "fixed_report", **item}
+    for item in spec.get("maintenance_jobs") or []:
+        jobs[item.get("task")] = {"job_type": "maintenance", **item}
+    return jobs
+
+
+def run_scheduled_job(args):
+    spec, path = load_schedule_spec()
+    jobs = build_scheduled_job_index(spec)
+    if getattr(args, "list", False):
+        json_out(
+            {
+                "ok": True,
+                "data": {
+                    "path": str(path),
+                    "jobs": list(jobs.values()),
+                },
+            }
+        )
+    job_name = getattr(args, "job", None)
+    if not job_name:
+        json_out({"ok": False, "error": "缺少 --job"}, 1)
+    job = jobs.get(job_name)
+    if not job:
+        json_out({"ok": False, "error": f"未知计划任务: {job_name}", "available_jobs": sorted(jobs.keys())}, 1)
+    if getattr(args, "dry_run", False):
+        json_out({"ok": True, "data": {"path": str(path), "job": job}})
+    delegated = None
+    if job.get("job_type") == "maintenance" and job_name == "delivery_retry":
+        delegated = ["report-retry", "--all-due", "--limit", str(job.get("limit") or 10)]
+    elif job.get("job_type") == "fixed_report":
+        delegated = ["auto", "--report-type", job_name]
+    if delegated:
+        started_at = iso_utc_now()
+        env = os.environ.copy()
+        env["SCREENER_RUN_CONTEXT"] = "scheduled"
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), *delegated],
+            cwd=str(Path(__file__).resolve().parent),
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        stdout = (proc.stdout or "").strip()
+        stderr = (proc.stderr or "").strip()
+        payload = None
+        skipped = False
+        if stdout:
+            try:
+                payload = json.loads(stdout)
+            except json.JSONDecodeError:
+                payload = None
+        if isinstance(payload, dict):
+            skipped = bool(((payload.get("data") or {}).get("skipped")))
+        entry = append_scheduled_run_log(
+            {
+                "run_id": f"{job_name}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+                "job_id": job_name,
+                "job_type": job.get("job_type"),
+                "started_at": started_at,
+                "finished_at": iso_utc_now(),
+                "status": "skipped" if skipped else ("completed" if proc.returncode == 0 else "failed"),
+                "exit_code": proc.returncode,
+                "delegated_command": [sys.executable, str(Path(__file__).resolve()), *delegated],
+                "schedule_path": str(path),
+                "stderr": stderr or None,
+                "result_ok": payload.get("ok") if isinstance(payload, dict) else None,
+                "report_id": ((payload or {}).get("data") or {}).get("report", {}).get("report_id"),
+                "report_type": ((payload or {}).get("data") or {}).get("report", {}).get("report_type"),
+                "retried": ((payload or {}).get("data") or {}).get("retried"),
+                "skipped": skipped,
+            }
+        )
+        wrapper = {
+            "ok": proc.returncode == 0,
+            "data": {
+                "path": str(path),
+                "job": job,
+                "delegated_command": delegated,
+                "run_log_entry": entry,
+                "result": payload if payload is not None else {"stdout": stdout, "stderr": stderr},
+            },
+        }
+        if proc.returncode != 0 and payload is None:
+            wrapper["error"] = stderr or stdout or f"scheduled job failed: {job_name}"
+            json_out(wrapper, 1)
+        json_out(wrapper, proc.returncode)
+        return
+    json_out({"ok": False, "error": f"暂不支持的计划任务: {job_name}"}, 1)
+
+
+def output_scheduled_runs(args):
+    json_out(
+        {
+            "ok": True,
+            "data": query_scheduled_run_log(
+                job=getattr(args, "job", None),
+                status=getattr(args, "status", None),
+                limit=int(getattr(args, "limit", 20)),
+            ),
+        }
+    )
 
 
 def load_trading_calendar(calendar_file):
@@ -1061,7 +2530,12 @@ def load_universe_symbols(args):
         meta = getattr(args, "_universe_meta", {})
         meta["invalid_symbols"] = invalid_symbols
         setattr(args, "_universe_meta", meta)
-    return normalized
+    valid_symbols, quote_invalid_symbols = filter_symbols_with_quote_probe(normalized)
+    if quote_invalid_symbols:
+        meta = getattr(args, "_universe_meta", {})
+        meta["quote_invalid_symbols"] = quote_invalid_symbols
+        setattr(args, "_universe_meta", meta)
+    return valid_symbols
 
 
 def chunk_list(values, size):
@@ -1076,6 +2550,39 @@ def fetch_quotes(symbols, batch_size=50):
         data = payload.get("data") or []
         rows.extend(data)
     return rows
+
+
+def filter_symbols_with_quote_probe(symbols, batch_size=50):
+    valid_symbols = []
+    invalid_symbols = []
+    seen = set()
+    for batch in chunk_list(symbols, batch_size):
+        payload = call_futu_skill_safe(["quote", "--symbols", *batch])
+        if payload.get("ok"):
+            returned = set()
+            for row in payload.get("data") or []:
+                symbol = extract_quote_symbol(row)
+                if symbol:
+                    returned.add(symbol)
+            for symbol in batch:
+                if symbol in returned and symbol not in seen:
+                    seen.add(symbol)
+                    valid_symbols.append(symbol)
+                elif symbol not in returned:
+                    invalid_symbols.append({"symbol": symbol, "error": "quote_not_returned"})
+            continue
+        if len(batch) == 1:
+            invalid_symbols.append({"symbol": batch[0], "error": payload.get("error") or "quote_probe_failed"})
+            continue
+        for symbol in batch:
+            single = call_futu_skill_safe(["quote", "--symbols", symbol])
+            if single.get("ok"):
+                if symbol not in seen:
+                    seen.add(symbol)
+                    valid_symbols.append(symbol)
+            else:
+                invalid_symbols.append({"symbol": symbol, "error": single.get("error") or payload.get("error") or "quote_probe_failed"})
+    return valid_symbols, invalid_symbols
 
 
 def extract_quote_liquidity(row):
@@ -1311,18 +2818,29 @@ def execute_trades(allocation, collect_data, args):
 def build_report_markdown(payload):
     data = payload.get("data", {})
     config = data.get("config", {})
+    report_context = data.get("report_context") or {}
+    report_type = report_context.get("report_type") or "ad_hoc_screen"
+    report_window_id = report_context.get("window_id")
+    report_profile = pick_report_profile(report_type)
     auto_ctx = data.get("auto") or {}
     screened = data.get("screened") or []
     dropped = data.get("dropped") or []
     allocation = data.get("portfolio", {}).get("allocation") or []
+    portfolio = data.get("portfolio", {}) or {}
     trades = data.get("trades") or {}
     decision = data.get("decision") or {}
+    summary = data.get("summary") or {}
+    event_alerts = data.get("event_alerts") or []
+    target_projection = portfolio.get("target_projection") or {}
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = []
-    lines.append("# 港股机会筛选与交易执行报告")
+    lines.append(f"# {report_profile['headline']}")
     lines.append("")
     lines.append("## 报告摘要")
     lines.append(f"- 报告时间：{now}")
+    lines.append(f"- 报告类型：{report_type}")
+    if report_window_id:
+        lines.append(f"- 汇报窗口：{report_window_id}")
     lines.append(f"- 市场范围：{config.get('market', 'HK')}")
     if auto_ctx:
         lines.append(f"- 标的池规模：{auto_ctx.get('universe_total', 0)}")
@@ -1334,6 +2852,23 @@ def build_report_markdown(payload):
         if universe_meta.get("date"):
             lines.append(f"- 标的池日期：{universe_meta.get('date')}")
     lines.append(f"- 最终入选数量：{len(screened)}")
+    if summary.get("negative_information_flags") is not None:
+        lines.append(f"- 信息面风险标记数：{summary.get('negative_information_flags')}")
+    lines.append("")
+    lines.append("## 当前结论")
+    if report_type == "event_alert":
+        if event_alerts:
+            lines.append(f"- 当前触发 {len(event_alerts)} 条事件快报条件，建议立即复核动作优先级")
+        else:
+            lines.append("- 当前未命中事件快报规则")
+    elif report_type == "post_close":
+        lines.append(f"- 收盘后确认：成交 {len([item for item in trades.get('orders', []) if item.get('status') == 'submitted'])} 笔，失败 {len([item for item in trades.get('orders', []) if item.get('status') == 'failed'])} 笔")
+    elif report_type == "night_review":
+        lines.append(f"- 夜间复盘结论：今日入选 {len(screened)}，排除 {len(dropped)}，次日继续跟踪 {min(len(dropped), 3)} 只重点标的")
+    elif report_type == "pre_close_risk":
+        lines.append(f"- 收盘前判断：当前建议仓位 {len(allocation)}，现金权重 {format_percent(portfolio.get('cash_weight'))}")
+    else:
+        lines.append(f"- 团队当前判断：{report_profile.get('trade' if allocation else 'watch' if screened else 'no_action')}")
     lines.append("")
     lines.append("## 市场与机会概览")
     candidates = []
@@ -1361,6 +2896,47 @@ def build_report_markdown(payload):
     else:
         lines.append("- 本轮未发现符合条件的潜在机会")
     lines.append("")
+    lines.append("## 信息面与事件窗口")
+    info_rows = screened if screened else dropped[: min(len(dropped), 5)]
+    if config.get("disable_information"):
+        lines.append("- 已关闭信息面采集")
+    elif info_rows:
+        lines.append("")
+        lines.append("| 标的 | 信息分 | 新闻 | 公告 | 下次业绩窗口 | 风险标签 |")
+        lines.append("| --- | --- | --- | --- | --- | --- |")
+        for item in info_rows:
+            info = item.get("information") or {}
+            news = info.get("news", {})
+            announcements = info.get("announcements", {})
+            earnings = info.get("earnings_calendar", {})
+            next_event = "N/A"
+            if earnings.get("items"):
+                next_item = earnings.get("items")[0]
+                next_event = f"{next_item.get('bm_date')} ({next_item.get('days_until')}d)"
+            risk_flags = ",".join(info.get("risk_flags") or []) or "-"
+            lines.append(
+                f"| {item.get('symbol')} | {item.get('scores', {}).get('information') or 'N/A'} | "
+                f"+{news.get('positive_count', 0)}/-{news.get('negative_count', 0)} | "
+                f"+{announcements.get('positive_count', 0)}/-{announcements.get('negative_count', 0)} | "
+                f"{next_event} | {risk_flags} |"
+            )
+        lines.append("")
+        for item in info_rows[:3]:
+            info = item.get("information") or {}
+            top_news = (info.get("news", {}).get("items") or [])[:1]
+            top_announcement = (info.get("announcements", {}).get("items") or [])[:1]
+            if top_news:
+                lines.append(f"- {item.get('symbol')} 新闻：{top_news[0].get('title')}")
+            if top_announcement:
+                lines.append(f"- {item.get('symbol')} 公告：{top_announcement[0].get('title')}")
+    else:
+        lines.append("- 未抓到可用的信息面数据")
+    lines.append("")
+    if event_alerts:
+        lines.append("## 事件快报触发")
+        for item in event_alerts:
+            lines.append(f"- [{item.get('severity')}] {item.get('summary')}")
+        lines.append("")
     lines.append("## 决策框架与规则")
     lines.append(f"- 因子权重：{json.dumps(config.get('weights', {}), ensure_ascii=False)}")
     lines.append(f"- 阈值设置：{json.dumps(config.get('thresholds', {}), ensure_ascii=False)}")
@@ -1427,6 +3003,38 @@ def build_report_markdown(payload):
     else:
         lines.append("- 交易价位：无")
     lines.append("")
+    if report_type == "pre_close_risk":
+        lines.append("## 隔夜风险检查")
+        if event_alerts:
+            lines.append("- 隔夜前已有事件触发，需优先复核公告、财报和执行异常")
+        else:
+            lines.append("- 当前未触发新增隔夜异常，保持常规风险观察")
+        if dropped:
+            lines.append(f"- 主要风险标的：{', '.join(item.get('symbol') for item in dropped[:3])}")
+        lines.append("")
+    if report_type == "post_close":
+        lines.append("## 执行偏差与归因")
+        failed_orders = [item for item in trades.get("orders", []) if item.get("status") == "failed"]
+        if failed_orders:
+            for item in failed_orders[:5]:
+                lines.append(f"- 执行失败：{item.get('symbol')}，原因={item.get('error') or 'unknown'}")
+        elif trades.get("orders"):
+            lines.append("- 今日订单已完成提交，未发现执行失败")
+        else:
+            lines.append("- 今日无订单执行，主要偏差来自信号与阈值未满足")
+        if target_projection.get("gap") is not None:
+            lines.append(f"- 月目标偏差：{format_percent(target_projection.get('gap'))}")
+        lines.append("")
+    if report_type == "night_review":
+        lines.append("## 夜间复盘结论")
+        if dropped:
+            for item in dropped[:3]:
+                lines.append(f"- 失效点：{item.get('symbol')} 因 {', '.join(item.get('reasons') or ['阈值未满足'])} 被排除")
+        else:
+            lines.append("- 今日无明显失效样本")
+        lines.append("- 规则更新建议：若连续多日无入选，可评估扩充标的池或重审阈值")
+        lines.append("- 次日观察重点：优先跟踪近 7 天财报窗口和信息面风险标的")
+        lines.append("")
     lines.append("## 7天收益预测")
     forecast = compute_portfolio_7d_forecast(allocation, screened)
     if forecast is None:
@@ -1446,18 +3054,228 @@ def build_report_markdown(payload):
     return "\n".join(lines)
 
 
-def deliver_report_to_owner(report_path, content):
-    endpoint = os.environ.get("OPENCLAW_OWNER_WEBHOOK") or os.environ.get("OPENCLAW_OWNER_ENDPOINT")
-    if not endpoint:
-        return {"delivered": False, "mode": "stdout"}
-    payload = json.dumps({"report_path": report_path, "content": content}, ensure_ascii=False).encode("utf-8")
-    request = Request(endpoint, data=payload, headers={"Content-Type": "application/json"})
+def get_report_delivery_priority(report_type):
+    if report_type == "event_alert":
+        return "high"
+    if report_type in {"pre_close_risk", "post_close", "night_review"}:
+        return "normal"
+    return "normal"
+
+
+def parse_non_negative_int_env(name, default_value):
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default_value
     try:
-        with urlopen(request, timeout=10) as response:
-            status = getattr(response, "status", 200)
-            return {"delivered": 200 <= status < 300, "mode": "webhook", "status": status}
-    except URLError as exc:
-        return {"delivered": False, "mode": "webhook", "error": str(exc)}
+        value = int(raw)
+    except ValueError:
+        return default_value
+    return max(0, value)
+
+
+def resolve_owner_endpoint(priority):
+    if priority == "high":
+        return (
+            os.environ.get("OPENCLAW_OWNER_WEBHOOK_HIGH_PRIORITY")
+            or os.environ.get("OPENCLAW_OWNER_ENDPOINT_HIGH_PRIORITY")
+            or os.environ.get("OPENCLAW_OWNER_WEBHOOK")
+            or os.environ.get("OPENCLAW_OWNER_ENDPOINT")
+        )
+    return os.environ.get("OPENCLAW_OWNER_WEBHOOK") or os.environ.get("OPENCLAW_OWNER_ENDPOINT")
+
+
+def build_delivery_retry_config(priority):
+    if priority == "high":
+        return {
+            "max_attempts": max(
+                1,
+                parse_non_negative_int_env("OPENCLAW_OWNER_DELIVERY_ATTEMPTS_HIGH_PRIORITY", 3),
+            ),
+            "backoff_ms": parse_non_negative_int_env("OPENCLAW_OWNER_DELIVERY_BACKOFF_MS_HIGH_PRIORITY", 500),
+        }
+    return {
+        "max_attempts": max(1, parse_non_negative_int_env("OPENCLAW_OWNER_DELIVERY_ATTEMPTS", 2)),
+        "backoff_ms": parse_non_negative_int_env("OPENCLAW_OWNER_DELIVERY_BACKOFF_MS", 1500),
+    }
+
+
+def deliver_report_to_endpoint(endpoint, report_path, content, report_meta, priority):
+    payload = json.dumps(
+        {
+            "report_path": report_path,
+            "content": content,
+            "report_id": report_meta.get("report_id"),
+            "report_type": report_meta.get("report_type"),
+            "parent_report_id": report_meta.get("parent_report_id"),
+            "priority": priority,
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    request = Request(endpoint, data=payload, headers={"Content-Type": "application/json"})
+    with urlopen(request, timeout=10) as response:
+        status = getattr(response, "status", 200)
+        mode = "webhook_high_priority" if priority == "high" else "webhook"
+        return {
+            "delivered": 200 <= status < 300,
+            "mode": mode,
+            "status": status,
+            "priority": priority,
+        }
+
+
+def deliver_report_to_owner(report_path, content, report_meta):
+    priority = get_report_delivery_priority(report_meta.get("report_type"))
+    endpoint = resolve_owner_endpoint(priority)
+    if not endpoint:
+        return {"delivered": False, "mode": "stdout", "priority": priority, "attempts": 0, "retry_count": 0}
+    retry_config = build_delivery_retry_config(priority)
+    attempts = 0
+    errors = []
+    last_result = None
+    while attempts < retry_config["max_attempts"]:
+        attempts += 1
+        try:
+            last_result = deliver_report_to_endpoint(endpoint, report_path, content, report_meta, priority)
+            if last_result.get("delivered"):
+                return {
+                    **last_result,
+                    "attempts": attempts,
+                    "retry_count": max(0, attempts - 1),
+                    "errors": errors,
+                }
+            status = last_result.get("status")
+            errors.append(f"http_status={status}")
+        except URLError as exc:
+            errors.append(str(exc))
+            last_result = {
+                "delivered": False,
+                "mode": "webhook_high_priority" if priority == "high" else "webhook",
+                "priority": priority,
+                "error": str(exc),
+            }
+        if attempts < retry_config["max_attempts"] and retry_config["backoff_ms"] > 0:
+            time.sleep(retry_config["backoff_ms"] / 1000.0)
+    return {
+        **(last_result or {"delivered": False, "mode": "webhook", "priority": priority}),
+        "attempts": attempts,
+        "retry_count": max(0, attempts - 1),
+        "errors": errors,
+        "error": (last_result or {}).get("error") or (errors[-1] if errors else None),
+    }
+
+
+def emit_archived_report_bundle(report_root, payload):
+    report_content = build_report_markdown(payload)
+    team_report = build_screener_team_report(payload)
+    archived_report = archive_team_report(report_root, team_report, report_content)
+    delivery = deliver_report_to_owner(archived_report["markdown_path"], report_content, team_report["meta"])
+    archived_report = update_archived_report_delivery(report_root, team_report, report_content, delivery)
+    return {
+        "team_report": team_report,
+        "content": report_content,
+        "delivery": delivery,
+        "archived": archived_report,
+    }
+
+
+def sync_report_retry_queue(report_root, bundle):
+    report = bundle["team_report"]
+    archived = bundle["archived"]
+    delivery = bundle["delivery"]
+    report_id = report["meta"]["report_id"]
+    if delivery.get("delivered") or delivery.get("mode") == "stdout":
+        remove_retry_queue_entry(report_root, report_id)
+        return None
+    return upsert_retry_queue_entry(
+        report_root,
+        report,
+        archived["json_path"],
+        archived["markdown_path"],
+        delivery,
+    )
+
+
+def retry_report_entries(report_root, entries):
+    queue_path = list_retry_queue(report_root, due_only=False, limit=0)["queue_path"]
+    results = []
+    for entry in entries:
+        report_id = entry.get("report_id")
+        json_path = entry.get("json_path")
+        markdown_path = entry.get("markdown_path")
+        report = load_json_file(json_path, None)
+        if not report:
+            remove_retry_queue_entry(report_root, report_id)
+            results.append(
+                {
+                    "report_id": report_id,
+                    "ok": False,
+                    "removed_from_queue": True,
+                    "error": f"missing_json:{json_path}",
+                }
+            )
+            continue
+        try:
+            content = Path(markdown_path).read_text(encoding="utf-8")
+        except OSError as exc:
+            remove_retry_queue_entry(report_root, report_id)
+            results.append(
+                {
+                    "report_id": report_id,
+                    "report_type": report["meta"].get("report_type"),
+                    "ok": False,
+                    "removed_from_queue": True,
+                    "error": str(exc),
+                }
+            )
+            continue
+        delivery = deliver_report_to_owner(markdown_path, content, report["meta"])
+        archived = update_archived_report_delivery(report_root, report, content, delivery)
+        bundle = {"team_report": report, "archived": archived, "delivery": delivery}
+        retry_entry = sync_report_retry_queue(report_root, bundle)
+        results.append(
+            {
+                "report_id": report["meta"]["report_id"],
+                "report_type": report["meta"]["report_type"],
+                "delivered": delivery.get("delivered"),
+                "mode": delivery.get("mode"),
+                "priority": delivery.get("priority"),
+                "delivery_attempt": delivery.get("attempts"),
+                "retry_count": delivery.get("retry_count"),
+                "error": delivery.get("error"),
+                "retry_queue": retry_entry,
+            }
+        )
+    return {
+        "retried": len(results),
+        "results": results,
+        "queue_path": queue_path,
+    }
+
+
+def process_due_retry_queue(report_root, limit=5):
+    due_queue = list_retry_queue(report_root, due_only=True, limit=int(limit))
+    due_entries = due_queue["entries"]
+    if not due_entries:
+        return {
+            "processed": False,
+            "retried": 0,
+            "delivered": 0,
+            "failed": 0,
+            "queue_path": due_queue["queue_path"],
+            "due_total": 0,
+        }
+    retried = retry_report_entries(report_root, due_entries)
+    delivered = len([item for item in retried["results"] if item.get("delivered")])
+    failed = len([item for item in retried["results"] if not item.get("delivered")])
+    return {
+        "processed": True,
+        "retried": retried["retried"],
+        "delivered": delivered,
+        "failed": failed,
+        "queue_path": retried["queue_path"],
+        "due_total": len(due_entries),
+        "results": retried["results"],
+    }
 
 
 def resolve_date_window(args):
@@ -1813,7 +3631,12 @@ def write_cache_payload(cache_dir, stage, scope, date_tag, payload, version=None
 
 def build_workflow_spec():
     return {
-        "数据源": "clawtrade-futu-paper-trade（港股）",
+        "数据源": [
+            "clawtrade-futu-paper-trade（港股行情与财务指标）",
+            "Google News RSS（公司新闻）",
+            "HKEX Title Search（正式公告）",
+            "HKEX Board Meeting Notifications（财报日历）",
+        ],
         "定时任务": build_schedule_spec(),
         "LLM约束策略": {
             "流程解耦": ["数据采集", "信息筛选", "因子分析", "决策汇总", "反思更新"],
@@ -1924,12 +3747,17 @@ def build_workflow_spec():
 
 
 def screen_symbols(args):
+    report_root = get_report_root()
+    retry_processing = None
+    if not getattr(args, "disable_retry_drain", False):
+        retry_processing = process_due_retry_queue(report_root, int(getattr(args, "retry_due_limit", 5)))
     default_weights = {
-        "quality": 0.3,
-        "growth": 0.25,
-        "valuation": 0.2,
+        "quality": 0.25,
+        "growth": 0.2,
+        "valuation": 0.15,
         "momentum": 0.15,
         "risk": 0.1,
+        "information": 0.15,
     }
     default_thresholds = {
         "overall": 60.0,
@@ -1938,6 +3766,7 @@ def screen_symbols(args):
         "valuation": 40.0,
         "momentum": 50.0,
         "risk": 40.0,
+        "information": 45.0,
     }
     weights = parse_weights(args.weights) or default_weights
     thresholds = parse_thresholds(args.thresholds) or default_thresholds
@@ -1951,8 +3780,22 @@ def screen_symbols(args):
     start, end = resolve_date_window(args)
     rows = []
     collect_data = {}
+    quote_rows = fetch_quotes(args.symbols)
+    quote_map = {}
+    for row in quote_rows:
+        symbol = extract_quote_symbol(row)
+        if symbol:
+            quote_map[symbol] = row
     for symbol in args.symbols:
         norm_symbol = normalize_hk_symbol(symbol)
+        quote_row = quote_map.get(norm_symbol, {})
+        company_name = (
+            quote_row.get("name")
+            or quote_row.get("stock_name")
+            or quote_row.get("stock_name_cn")
+            or fetch_hkex_stock_lookup(norm_symbol).get("name")
+            or norm_symbol
+        )
         kline_rows = fetch_kline(norm_symbol, start, end, args.ktype, args.autype, args.max_count)
         prices = extract_prices(kline_rows)
         indicator_rows = fetch_financial_indicators(norm_symbol, args.period, args.start, args.end)
@@ -1989,9 +3832,16 @@ def screen_symbols(args):
             monthly_target,
             monthly_vol,
         )
+        information = None
+        if not getattr(args, "disable_information", False):
+            try:
+                information = build_information_snapshot(norm_symbol, company_name, args)
+            except Exception:
+                information = {"available": False, "score": None, "risk_flags": [], "news": {}, "announcements": {}, "earnings_calendar": {}}
         rows.append(
             {
                 "symbol": norm_symbol,
+                "company_name": company_name,
                 "market": "HK",
                 "roe": roe,
                 "gross_margin": gross_margin,
@@ -2010,10 +3860,19 @@ def screen_symbols(args):
                 "max_drawdown": max_drawdown,
                 "target_stress": stress,
                 "position_budget": position_budget,
+                "news_score": information.get("news", {}).get("score") if information else None,
+                "announcement_score": information.get("announcements", {}).get("score") if information else None,
+                "event_score": information.get("earnings_calendar", {}).get("score") if information else None,
+                "news_count": len(information.get("news", {}).get("items") or []) if information else None,
+                "announcement_count": len(information.get("announcements", {}).get("items") or []) if information else None,
+                "next_earnings_in_days": information.get("earnings_calendar", {}).get("next_in_days") if information else None,
+                "information_score": information.get("score") if information else None,
+                "information_risk_flags": information.get("risk_flags") if information else [],
             }
         )
         last_close = prices[-1] if prices else None
         collect_data[norm_symbol] = {
+            "company_name": company_name,
             "kline_summary": {
                 "start": start,
                 "end": end,
@@ -2022,6 +3881,7 @@ def screen_symbols(args):
             },
             "financial_snapshot": latest or {},
             "indicator_count": len(indicator_rows),
+            "information_snapshot": information or {"available": False},
         }
     quality_metrics = ["roe", "gross_margin", "net_margin", "debt_ratio"]
     growth_metrics = ["revenue_growth", "profit_growth"]
@@ -2049,12 +3909,34 @@ def screen_symbols(args):
     valuation_scores, valuation_metric_scores, valuation_meta = score_factor(rows, valuation_metrics, higher_better)
     momentum_scores, momentum_metric_scores, momentum_meta = score_factor(rows, momentum_metrics, higher_better)
     risk_scores, risk_metric_scores, risk_meta = score_factor(rows, risk_metrics, higher_better)
+    information_scores = [row.get("information_score") for row in rows]
+    information_meta = []
+    for row in rows:
+        available_metrics = len(
+            [
+                item
+                for item in (
+                    row.get("news_score"),
+                    row.get("announcement_score"),
+                    row.get("event_score"),
+                )
+                if item is not None
+            ]
+        )
+        information_meta.append(
+            {
+                "valid_metrics": available_metrics,
+                "total_metrics": 3,
+                "coverage": available_metrics / 3 if available_metrics else 0.0,
+            }
+        )
     factor_map = {
         "quality": quality_scores,
         "growth": growth_scores,
         "valuation": valuation_scores,
         "momentum": momentum_scores,
         "risk": risk_scores,
+        "information": information_scores,
     }
     available_factors = [key for key, values in factor_map.items() if any(v is not None for v in values)]
     norm_weights = normalize_weights(weights, available_factors)
@@ -2067,6 +3949,7 @@ def screen_symbols(args):
             "valuation": valuation_scores[idx],
             "momentum": momentum_scores[idx],
             "risk": risk_scores[idx],
+            "information": information_scores[idx],
         }
         weighted_scores = []
         for key, score in factor_scores.items():
@@ -2090,8 +3973,10 @@ def screen_symbols(args):
                 reasons.append("target_underperform_1m")
         payload = {
             "symbol": row["symbol"],
+            "company_name": row.get("company_name"),
             "market": row["market"],
             "metrics": row,
+            "information": collect_data.get(row["symbol"], {}).get("information_snapshot"),
             "scores": {**factor_scores, "overall": overall},
             "score_meta": {
                 "quality": quality_meta[idx],
@@ -2099,6 +3984,7 @@ def screen_symbols(args):
                 "valuation": valuation_meta[idx],
                 "momentum": momentum_meta[idx],
                 "risk": risk_meta[idx],
+                "information": information_meta[idx],
             },
             "metric_scores": {
                 "quality": {k: quality_metric_scores[k][idx] for k in quality_metrics},
@@ -2106,6 +3992,11 @@ def screen_symbols(args):
                 "valuation": {k: valuation_metric_scores[k][idx] for k in valuation_metrics},
                 "momentum": {k: momentum_metric_scores[k][idx] for k in momentum_metrics},
                 "risk": {k: risk_metric_scores[k][idx] for k in risk_metrics},
+                "information": {
+                    "news_score": row.get("news_score"),
+                    "announcement_score": row.get("announcement_score"),
+                    "event_score": row.get("event_score"),
+                },
             },
         }
         if reasons:
@@ -2194,7 +4085,12 @@ def screen_symbols(args):
                 "start": start,
                 "end": end,
                 "market": "HK",
-                "data_source": "clawtrade-futu-paper-trade",
+                "data_source": [
+                    "clawtrade-futu-paper-trade",
+                    "google-news-rss",
+                    "hkex-title-search",
+                    "hkex-board-meeting-notifications",
+                ],
                 "ktype": args.ktype,
                 "autype": args.autype,
                 "monthly_target": monthly_target,
@@ -2208,11 +4104,21 @@ def screen_symbols(args):
                 "capacity_caps": capacity_caps,
                 "portfolio_target": portfolio_target,
                 "focus_sectors": focus_sectors,
+                "disable_information": bool(getattr(args, "disable_information", False)),
+                "news_lookback_days": int(getattr(args, "news_lookback_days", 14)),
+                "news_limit": int(getattr(args, "news_limit", 5)),
+                "announcement_lookback_days": int(getattr(args, "announcement_lookback_days", 30)),
+                "announcement_limit": int(getattr(args, "announcement_limit", 6)),
+                "earnings_lookahead_days": int(getattr(args, "earnings_lookahead_days", 120)),
             },
             "summary": {
                 "symbols": len(rows),
                 "screened": len(screened),
                 "dropped": len(dropped),
+                "upcoming_earnings_7d": len(
+                    [row for row in rows if row.get("next_earnings_in_days") is not None and row.get("next_earnings_in_days") <= 7]
+                ),
+                "negative_information_flags": len([row for row in rows if row.get("information_risk_flags")]),
             },
             "screened": screened,
             "dropped": dropped,
@@ -2225,25 +4131,111 @@ def screen_symbols(args):
             "decision": decision,
         },
     }
+    if retry_processing:
+        output_payload["data"]["retry_processing"] = retry_processing
     if getattr(args, "_auto_context", None):
         output_payload["data"]["auto"] = args._auto_context
     trades = execute_trades(allocation, collect_data, args)
     output_payload["data"]["trades"] = trades
+    output_payload["data"]["report_context"] = {
+        "report_type": getattr(args, "report_type", None) or "ad_hoc_screen",
+        "window_id": getattr(args, "report_window_id", None),
+        "task_id": getattr(args, "task_id", None),
+        "workflow_id": getattr(args, "workflow_id", None),
+        "trigger_type": "scheduled" if getattr(args, "_auto_context", None) else "manual",
+    }
+    output_payload["data"]["event_alerts"] = detect_event_alerts(output_payload)
     report_dir = resolve_report_dir(getattr(args, "report_dir", None))
     report_content = build_report_markdown(output_payload)
     report_name = f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
     report_path = str((report_dir / report_name).resolve())
     Path(report_path).write_text(report_content, encoding="utf-8")
-    delivery = deliver_report_to_owner(report_path, report_content)
+    primary_bundle = emit_archived_report_bundle(report_root, output_payload)
+    primary_retry_entry = sync_report_retry_queue(report_root, primary_bundle)
+    team_report = primary_bundle["team_report"]
+    delivery = primary_bundle["delivery"]
+    archived_report = primary_bundle["archived"]
     output_payload["data"]["report"] = {
+        "report_id": team_report["meta"]["report_id"],
+        "report_type": team_report["meta"]["report_type"],
+        "priority": delivery.get("priority"),
+        "delivery_attempt": delivery.get("attempts"),
+        "retry_count": delivery.get("retry_count"),
         "path": report_path,
+        "archive_markdown_path": archived_report["markdown_path"],
+        "archive_json_path": archived_report["json_path"],
+        "manifest_path": archived_report["manifest_path"],
         "delivered": delivery.get("delivered"),
         "mode": delivery.get("mode"),
         "status": delivery.get("status"),
         "error": delivery.get("error"),
+        "delivery_status": archived_report.get("delivery_status"),
     }
+    supplemental_reports = []
+    report_context = output_payload["data"].get("report_context") or {}
+    if output_payload["data"].get("event_alerts") and report_context.get("report_type") != "event_alert":
+        event_payload = copy.deepcopy(output_payload)
+        event_payload["data"]["report_context"] = {
+            **report_context,
+            "report_type": "event_alert",
+            "parent_report_id": team_report["meta"]["report_id"],
+            "trigger_type": "event_driven",
+        }
+        event_bundle = emit_archived_report_bundle(report_root, event_payload)
+        event_retry_entry = sync_report_retry_queue(report_root, event_bundle)
+        event_report = event_bundle["team_report"]
+        event_delivery = event_bundle["delivery"]
+        event_archived = event_bundle["archived"]
+        supplemental_reports.append(
+            {
+                "report_id": event_report["meta"]["report_id"],
+                "report_type": event_report["meta"]["report_type"],
+                "priority": event_delivery.get("priority"),
+                "delivery_attempt": event_delivery.get("attempts"),
+                "retry_count": event_delivery.get("retry_count"),
+                "parent_report_id": event_report["meta"].get("parent_report_id"),
+                "archive_markdown_path": event_archived["markdown_path"],
+                "archive_json_path": event_archived["json_path"],
+                "manifest_path": event_archived["manifest_path"],
+                "delivered": event_delivery.get("delivered"),
+                "mode": event_delivery.get("mode"),
+                "status": event_delivery.get("status"),
+                "error": event_delivery.get("error"),
+                "delivery_status": event_archived.get("delivery_status"),
+                "retry_queue": event_retry_entry,
+            }
+        )
+    if supplemental_reports:
+        output_payload["data"]["supplemental_reports"] = supplemental_reports
+    if primary_retry_entry:
+        output_payload["data"]["report"]["retry_queue"] = primary_retry_entry
+    owner_messages = []
     if not delivery.get("delivered"):
         output_payload["data"]["owner_message"] = report_content
+        owner_messages.append(
+            {
+                "report_id": team_report["meta"]["report_id"],
+                "report_type": team_report["meta"]["report_type"],
+                "priority": delivery.get("priority"),
+                "content": primary_bundle["content"],
+            }
+        )
+    for item in supplemental_reports:
+        if not item.get("delivered"):
+            try:
+                supplemental_content = Path(item["archive_markdown_path"]).read_text(encoding="utf-8")
+            except OSError:
+                supplemental_content = None
+            owner_messages.append(
+                {
+                    "report_id": item.get("report_id"),
+                    "report_type": item.get("report_type"),
+                    "priority": item.get("priority"),
+                    "content": supplemental_content,
+                }
+            )
+    if owner_messages:
+        output_payload["data"]["owner_messages"] = owner_messages
     if args.save_cache:
         stage_list = parse_stage_list(args.cache_stages) or ["decide"]
         allowed = {"collect", "filter", "analyze", "decide", "review"}
@@ -2270,6 +4262,8 @@ def screen_symbols(args):
             "volatility_252d",
             "max_drawdown",
         ]
+        if not getattr(args, "disable_information", False):
+            metric_keys.extend(["news_score", "announcement_score", "event_score", "information_score"])
         quality_info = build_quality_info(rows, metric_keys)
         summary_info = build_summary_info(screened, dropped)
         cache_paths = []
@@ -2282,6 +4276,30 @@ def screen_symbols(args):
                 "symbols": [item["symbol"] for item in rows],
             }
             if stage == "collect":
+                events = []
+                for symbol, snapshot in collect_data.items():
+                    info = snapshot.get("information_snapshot") or {}
+                    for item in info.get("announcements", {}).get("items") or []:
+                        events.append(
+                            {
+                                "symbol": symbol,
+                                "type": "announcement",
+                                "date": item.get("release_time"),
+                                "title": item.get("title"),
+                                "signal": item.get("signal"),
+                                "link": item.get("link"),
+                            }
+                        )
+                    for item in info.get("earnings_calendar", {}).get("items") or []:
+                        events.append(
+                            {
+                                "symbol": symbol,
+                                "type": "earnings_calendar",
+                                "date": item.get("bm_date"),
+                                "title": item.get("purpose"),
+                                "signal": "negative" if (item.get("days_until") or 999) <= 7 else "neutral",
+                            }
+                        )
                 data = {
                     "company": collect_data,
                     "market": {
@@ -2294,7 +4312,7 @@ def screen_symbols(args):
                     },
                     "macro": [],
                     "industry": [],
-                    "events": [],
+                    "events": events,
                 }
                 if getattr(args, "_auto_context", None):
                     data["auto"] = args._auto_context
@@ -2315,6 +4333,7 @@ def screen_symbols(args):
                     "factors": weights,
                     "scores": {item["symbol"]: item.get("scores") for item in screened},
                     "metrics": {item["symbol"]: item.get("metrics") for item in screened},
+                    "information": {item["symbol"]: item.get("information") for item in screened},
                 }
             elif stage == "decide":
                 rankings = []
@@ -2377,6 +4396,55 @@ def screen_symbols(args):
 
 def output_workflow(_args):
     json_out({"ok": True, "data": build_workflow_spec()})
+
+
+def output_report_history(args):
+    report_root = get_report_root()
+    result = query_report_history(
+        report_root,
+        report_id=getattr(args, "report_id", None),
+        report_date=getattr(args, "date", None),
+        symbol=normalize_hk_symbol(args.symbol) if getattr(args, "symbol", None) else None,
+        report_type=getattr(args, "report_type", None),
+        window_id=getattr(args, "window_id", None),
+        delivery_status=getattr(args, "delivery_status", None),
+        limit=int(getattr(args, "limit", 20)),
+    )
+    if getattr(args, "include_retry_queue", False):
+        queue_all = list_retry_queue(report_root, due_only=False, limit=0)
+        queue_due = list_retry_queue(report_root, due_only=True, limit=0)
+        queue_map = {item.get("report_id"): item for item in queue_all["entries"]}
+        result["entries"] = [{**entry, "retry_queue": queue_map.get(entry.get("report_id"))} for entry in result["entries"]]
+        result["retry_queue"] = {
+            "queue_path": queue_all["queue_path"],
+            "total": queue_all["total"],
+            "due_total": queue_due["total"],
+        }
+    payload = {
+        "ok": True,
+        "data": result,
+    }
+    if getattr(args, "show_content", False) and result["entries"]:
+        entry = result["entries"][0]
+        payload["data"]["content"] = {
+            "report_id": entry.get("report_id"),
+            "format": args.content_format,
+            "value": read_report_content(entry, args.content_format),
+        }
+    json_out(payload)
+
+
+def retry_report_delivery(args):
+    report_root = get_report_root()
+    if getattr(args, "view", False):
+        json_out({"ok": True, "data": list_retry_queue(report_root, due_only=bool(getattr(args, "due_only", False)), limit=int(args.limit))})
+    queue = list_retry_queue(report_root, due_only=bool(getattr(args, "all_due", False)), limit=int(args.limit))
+    entries = queue["entries"]
+    if getattr(args, "report_id", None):
+        entries = [item for item in list_retry_queue(report_root, due_only=False, limit=0)["entries"] if item.get("report_id") == args.report_id]
+    if not entries:
+        json_out({"ok": True, "data": {"retried": 0, "results": [], "queue_path": queue["queue_path"]}})
+    json_out({"ok": True, "data": retry_report_entries(report_root, entries)})
 
 
 def manage_universe(args):
@@ -2527,9 +4595,34 @@ def build_tcc_result_payload(payload, command=None):
     report = data.get("report") or {}
     if report.get("path"):
         result["report"] = {
+            "report_id": report.get("report_id"),
+            "report_type": report.get("report_type"),
+            "priority": report.get("priority"),
+            "delivery_attempt": report.get("delivery_attempt"),
+            "retry_count": report.get("retry_count"),
             "path": report.get("path"),
+            "archive_markdown_path": report.get("archive_markdown_path"),
+            "archive_json_path": report.get("archive_json_path"),
+            "manifest_path": report.get("manifest_path"),
             "delivered": report.get("delivered"),
             "mode": report.get("mode"),
+            "delivery_status": report.get("delivery_status"),
+        }
+    supplemental_reports = data.get("supplemental_reports") or []
+    if supplemental_reports:
+        result["supplemental_reports"] = supplemental_reports
+    retry_queue = data.get("retry_queue") or data.get("report", {}).get("retry_queue")
+    if retry_queue:
+        result["retry_queue"] = retry_queue
+    retry_processing = data.get("retry_processing")
+    if retry_processing:
+        result["retry_processing"] = {
+            "processed": retry_processing.get("processed"),
+            "retried": retry_processing.get("retried"),
+            "delivered": retry_processing.get("delivered"),
+            "failed": retry_processing.get("failed"),
+            "due_total": retry_processing.get("due_total"),
+            "queue_path": retry_processing.get("queue_path"),
         }
     portfolio = data.get("portfolio") or {}
     allocation = portfolio.get("allocation") or []
@@ -2606,7 +4699,7 @@ def prepare_argv(argv):
     task_payload = get_tcc_task_payload(task_id)
     merged_payload = dict(task_payload)
     merged_payload.update(payload)
-    commands = {"workflow", "universe", "schedule", "screen", "auto"}
+    commands = {"workflow", "universe", "schedule", "screen", "auto", "reports", "report-retry", "run-scheduled", "scheduled-runs", "cron-export", "cron-install", "schedule-preferences", "openclaw-automation-spec", "report-settings", "report-settings-request"}
     if any(token in commands for token in argv):
         return argv, task_id, merged_payload
     return payload_to_argv(task_id, merged_payload), task_id, merged_payload
@@ -2637,7 +4730,65 @@ def build_parser():
     schedule.add_argument("--schedule-days")
     schedule.add_argument("--schedule-command")
     schedule.add_argument("--calendar-file")
+    schedule.add_argument("--retry-schedule-start")
+    schedule.add_argument("--retry-schedule-end")
+    schedule.add_argument("--retry-schedule-interval")
+    schedule.add_argument("--retry-limit", default="10")
+    schedule.add_argument("--disable-retry-maintenance", action="store_true")
     schedule.set_defaults(func=output_schedule)
+
+    schedule_preferences = sub.add_parser("schedule-preferences")
+    schedule_preferences.add_argument("--view", action="store_true")
+    schedule_preferences.add_argument("--reset", action="store_true")
+    schedule_preferences.add_argument("--profile", choices=["default", "compact", "minimal"])
+    schedule_preferences.add_argument("--scheduler-mode", choices=["openclaw_primary", "cron_primary"])
+    schedule_preferences.add_argument("--enable-report-types", nargs="+")
+    schedule_preferences.add_argument("--disable-report-types", nargs="+")
+    schedule_preferences.add_argument("--report-times")
+    schedule_preferences.add_argument("--enable-retry-maintenance", action="store_true")
+    schedule_preferences.add_argument("--disable-retry-maintenance", action="store_true")
+    schedule_preferences.add_argument("--retry-schedule-start")
+    schedule_preferences.add_argument("--retry-schedule-end")
+    schedule_preferences.add_argument("--retry-schedule-interval")
+    schedule_preferences.add_argument("--retry-limit")
+    schedule_preferences.set_defaults(func=manage_schedule_preferences)
+
+    run_scheduled = sub.add_parser("run-scheduled")
+    run_scheduled.add_argument("--job")
+    run_scheduled.add_argument("--list", action="store_true")
+    run_scheduled.add_argument("--dry-run", action="store_true")
+    run_scheduled.set_defaults(func=run_scheduled_job)
+
+    scheduled_runs = sub.add_parser("scheduled-runs")
+    scheduled_runs.add_argument("--job")
+    scheduled_runs.add_argument("--status")
+    scheduled_runs.add_argument("--limit", default="20")
+    scheduled_runs.set_defaults(func=output_scheduled_runs)
+
+    cron_export = sub.add_parser("cron-export")
+    cron_export.add_argument("--output")
+    cron_export.add_argument("--python-path")
+    cron_export.add_argument("--base-dir")
+    cron_export.set_defaults(func=export_cron)
+
+    cron_install = sub.add_parser("cron-install")
+    cron_install.add_argument("--output")
+    cron_install.add_argument("--python-path")
+    cron_install.add_argument("--base-dir")
+    cron_install.set_defaults(func=install_cron)
+
+    automation_spec = sub.add_parser("openclaw-automation-spec")
+    automation_spec.set_defaults(func=output_openclaw_automation_spec)
+
+    report_settings = sub.add_parser("report-settings")
+    report_settings.add_argument("--format", choices=["json", "markdown"], default="json")
+    report_settings.set_defaults(func=output_report_settings)
+
+    report_settings_request = sub.add_parser("report-settings-request")
+    report_settings_request.add_argument("--message", required=True)
+    report_settings_request.add_argument("--dry-run", action="store_true")
+    report_settings_request.add_argument("--format", choices=["json", "markdown"], default="json")
+    report_settings_request.set_defaults(func=output_report_settings_request)
 
     screen = sub.add_parser("screen")
     screen.add_argument("--symbols", nargs="+", required=True)
@@ -2665,7 +4816,17 @@ def build_parser():
     screen.add_argument("--cache-dir")
     screen.add_argument("--cache-stages", default="filter,analyze,decide")
     screen.add_argument("--report-dir")
+    screen.add_argument("--report-type", default="ad_hoc_screen")
+    screen.add_argument("--report-window-id")
+    screen.add_argument("--disable-retry-drain", action="store_true")
+    screen.add_argument("--retry-due-limit", default="5")
     screen.add_argument("--focus-sectors")
+    screen.add_argument("--disable-information", action="store_true")
+    screen.add_argument("--news-lookback-days", default="14")
+    screen.add_argument("--news-limit", default="5")
+    screen.add_argument("--announcement-lookback-days", default="30")
+    screen.add_argument("--announcement-limit", default="6")
+    screen.add_argument("--earnings-lookahead-days", default="120")
     screen.add_argument("--auto-trade", action="store_true")
     screen.add_argument("--trade-qty")
     screen.add_argument("--trade-budget")
@@ -2701,6 +4862,16 @@ def build_parser():
     auto.add_argument("--cache-dir")
     auto.add_argument("--cache-stages", default="filter,analyze,decide")
     auto.add_argument("--report-dir")
+    auto.add_argument("--report-type", default="pre_trade")
+    auto.add_argument("--report-window-id")
+    auto.add_argument("--disable-retry-drain", action="store_true")
+    auto.add_argument("--retry-due-limit", default="5")
+    auto.add_argument("--disable-information", action="store_true")
+    auto.add_argument("--news-lookback-days", default="14")
+    auto.add_argument("--news-limit", default="5")
+    auto.add_argument("--announcement-lookback-days", default="30")
+    auto.add_argument("--announcement-limit", default="6")
+    auto.add_argument("--earnings-lookahead-days", default="120")
     auto.add_argument("--auto-trade", action="store_true")
     auto.add_argument("--trade-qty")
     auto.add_argument("--trade-budget")
@@ -2720,6 +4891,27 @@ def build_parser():
     auto.add_argument("--calendar-file")
     auto.add_argument("--allow-non-trading", action="store_true")
     auto.set_defaults(func=auto_screen)
+
+    reports = sub.add_parser("reports")
+    reports.add_argument("--report-id")
+    reports.add_argument("--date")
+    reports.add_argument("--symbol")
+    reports.add_argument("--report-type")
+    reports.add_argument("--window-id")
+    reports.add_argument("--delivery-status")
+    reports.add_argument("--limit", default="20")
+    reports.add_argument("--include-retry-queue", action="store_true")
+    reports.add_argument("--show-content", action="store_true")
+    reports.add_argument("--content-format", choices=["markdown", "json"], default="markdown")
+    reports.set_defaults(func=output_report_history)
+
+    report_retry = sub.add_parser("report-retry")
+    report_retry.add_argument("--view", action="store_true")
+    report_retry.add_argument("--due-only", action="store_true")
+    report_retry.add_argument("--all-due", action="store_true")
+    report_retry.add_argument("--report-id")
+    report_retry.add_argument("--limit", default="20")
+    report_retry.set_defaults(func=retry_report_delivery)
     return parser
 
 
@@ -2738,7 +4930,8 @@ def main(argv=None):
         parser = build_parser()
         args = parser.parse_args(prepared_argv)
         command = getattr(args, "command", None)
-        args.func(args)
+        with runtime_execution_lock(command, task_id):
+            args.func(args)
         return 0
     except SkillExit as exc:
         if task_id:

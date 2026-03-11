@@ -1,0 +1,160 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Portfolio Survival Manager Window State",
+  "type": "object",
+  "required": [
+    "window_id",
+    "started_at",
+    "ends_at",
+    "start_nav",
+    "current_nav",
+    "current_return_pct",
+    "survival_floor_pct",
+    "target_nav_survival",
+    "window_status",
+    "risk_mode",
+    "days_elapsed",
+    "days_remaining",
+    "updated_at"
+  ],
+  "properties": {
+    "window_id": {
+      "type": "string"
+    },
+    "previous_window_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "ends_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "settled_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "start_nav": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "current_nav": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "peak_nav": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "exclusiveMinimum": 0
+    },
+    "survival_floor_pct": {
+      "type": "number"
+    },
+    "stretch_target_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "target_nav_survival": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "target_nav_stretch": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "exclusiveMinimum": 0
+    },
+    "current_return_pct": {
+      "type": "number"
+    },
+    "drawdown_from_peak_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "window_status": {
+      "type": "string",
+      "enum": [
+        "ahead",
+        "on_track",
+        "behind",
+        "settled"
+      ]
+    },
+    "risk_mode": {
+      "type": "string",
+      "enum": [
+        "defense",
+        "balanced",
+        "attack",
+        "lockdown"
+      ]
+    },
+    "days_elapsed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "days_remaining": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lockdown": {
+      "type": "boolean"
+    },
+    "allow_new_risk": {
+      "type": "boolean"
+    },
+    "allow_exit_only": {
+      "type": "boolean"
+    },
+    "survival_gap_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "stretch_gap_pct": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "last_decision_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_ledger_snapshot_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "notes": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "additionalProperties": false
+}
